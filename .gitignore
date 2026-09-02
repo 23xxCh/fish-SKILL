@@ -1,0 +1,28 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local login state, databases, and logs
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+browser-profile/
+
+# Generated collection results and application builds
+采集结果/
+outputs/
+build/
+dist/
+dist_v*/
+dist_v*.zip
+*.zip
+
+# Separate local projects and one-off reporting helper
+selfuse_publisher/
+reference_auto_reply/
+build_freeclip_wps.ps1

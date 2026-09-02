@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goofish-link-collector"
+version = "0.4.0"
+description = "Windows desktop collector and local new-item monitor for Goofish"
+requires-python = ">=3.13"
+dependencies = [
+  "openpyxl>=3.1,<4",
+  "playwright>=1.60,<2",
+  "PySide6>=6.11,<7",
+  "lark-oapi>=1.7.1,<2",
+]
+
+[project.scripts]
+goofish-link-collector = "goofish_collector.app:main"
+
+[tool.setuptools.packages.find]
+include = ["goofish_collector*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+markers = [
+  "browser: tests that launch the locally installed Edge browser",
+  "wps: tests that require local WPS COM automation",
+]

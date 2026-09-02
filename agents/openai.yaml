@@ -1,0 +1,4 @@
+interface:
+  display_name: "闲鱼本地采集器"
+  short_description: "安全运行、验收与维护本机闲鱼链接采集和新品监控工作流"
+  default_prompt: "使用本机闲鱼采集器完成一次链接采集或新品监控；先执行自检，扫码和风控页面交由我处理。"
