@@ -1,5 +1,4 @@
-from .app import main
+from .cli import run_cli
 
 
-raise SystemExit(main())
-
+raise SystemExit(run_cli())

@@ -11,6 +11,17 @@ python -m pytest -q
 
 For a visible source application, run `python -m goofish_collector`. If the packaged v7 app exists, `dist_v7\XianyuLinkCollector\XianyuLinkCollector.exe` is the preferred launch artifact.
 
+## Agent CLI
+
+Use source mode for the Agent CLI; the older packaged v7 executable does not include it.
+
+```powershell
+python -m goofish_collector collect --keyword "相机" --pages 2 --output-dir ".\采集结果" --min-price 100 --max-price 800 --personal-only
+python -m goofish_collector monitor-status
+```
+
+`collect` uses the same visible dedicated Edge profile as the desktop app. Its standard output is one JSON result, and it writes the same structured payload to `summary_json`. Treat `verification_required` as a request for the user to finish login or a safety page visibly; never substitute a hidden browser, a direct signed request, or copied cookies. `monitor-status` opens the database read-only and must not be used to start a scan or retry a notification.
+
 ## One-time collection
 
 1. Select **登录 / 切换账号**. The user completes QR-code login and any security page in the dedicated Edge window.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goofish-link-collector"
-version = "0.4.0"
+version = "0.5.0"
 description = "Windows desktop collector and local new-item monitor for Goofish"
 requires-python = ">=3.13"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-goofish-link-collector = "goofish_collector.app:main"
+goofish-link-collector = "goofish_collector.cli:run_cli"
 
 [tool.setuptools.packages.find]
 include = ["goofish_collector*"]

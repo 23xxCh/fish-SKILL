@@ -1,3 +1,7 @@
 """闲鱼商品采集与新品监控。"""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
+
+from .cli import run_cli
+
+__all__ = ["__version__", "run_cli"]

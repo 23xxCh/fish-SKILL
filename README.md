@@ -14,9 +14,28 @@ python -m goofish_collector
 python -m pytest -q
 ```
 
+## Agent 命令行接口
+
+v0.5 起，Agent 可通过受控命令调用已有的本机可见浏览器流程；不使用签名接口，也不会读取或输出 Cookie、通知密钥。
+
+```powershell
+# 先由用户在桌面程序中完成一次扫码登录
+python -m goofish_collector
+
+# Agent 的一次性采集：标准输出和输出目录都会得到 JSON 摘要
+python -m goofish_collector collect --keyword "相机" --pages 2 --output-dir ".\采集结果" --min-price 100 --max-price 800 --personal-only
+
+# 只读查看已保存的新品监控任务和通知队列
+python -m goofish_collector monitor-status
+```
+
+`collect` 支持关键词、页数、商品上限、输出目录、价格、地区、发布时间、商品条件及排序。完成时会输出 `completed`、Excel 路径和 `summary_json` 路径；在非交互运行中遇到登录或安全验证，会输出 `verification_required` 并保留检查点，不会尝试绕过。用户可在桌面程序或可交互终端的可见 Edge 中完成验证后再继续。
+
+`monitor-status` 只读取本机 `monitor.db`，返回任务状态、扫描统计和待发送/已发送/失败通知数；不启动扫描、不发送通知，也不返回通知凭据或批次正文。
+
 ## Codex Skill
 
-仓库根目录包含 `SKILL.md`，可作为 `goofish-local-collector` Skill 使用。它指导 Agent 在本机运行、验收和排查采集器；扫码登录、验证码、安全验证和通知凭据必须由用户在可见界面中处理。
+仓库根目录包含 `SKILL.md`，可作为 `goofish-local-collector` Skill 使用。它指导 Agent 通过桌面程序或 v0.5 命令行运行、验收和排查采集器；扫码登录、验证码、安全验证和通知凭据必须由用户在可见界面中处理。
 
 克隆后如需让 Codex 发现该 Skill，可把仓库目录链接到 `%USERPROFILE%\.codex\skills\goofish-local-collector`。不要把本机的浏览器登录目录、数据库或采集结果提交到仓库。
 
