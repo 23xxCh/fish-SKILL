@@ -18,6 +18,10 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+incompatible_runtime_dlls = {"icuuc.dll", "icudt78.dll"}
+package_binaries = [
+    entry for entry in a.binaries if entry[0].lower() not in incompatible_runtime_dlls
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -41,7 +45,7 @@ exe = EXE(
 
 coll = COLLECT(
     exe,
-    a.binaries,
+    package_binaries,
     a.datas,
     strip=False,
     upx=True,

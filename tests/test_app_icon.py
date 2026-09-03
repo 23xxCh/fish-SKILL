@@ -28,3 +28,11 @@ def test_pyinstaller_embeds_the_windows_icon() -> None:
     assert '("assets/app-icon.png", "assets")' in spec
     assert 'icon="assets/app-icon.ico"' in spec
     assert (project_root / "assets" / "app-icon.ico").is_file()
+
+
+def test_pyinstaller_filters_the_conflicting_icu_runtime() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    spec = (project_root / "XianyuLinkCollector.spec").read_text(encoding="utf-8")
+
+    assert 'incompatible_runtime_dlls = {"icuuc.dll", "icudt78.dll"}' in spec
+    assert "entry[0].lower() not in incompatible_runtime_dlls" in spec
