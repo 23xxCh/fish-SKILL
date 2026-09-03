@@ -3,7 +3,7 @@ from datetime import datetime
 import pytest
 
 from goofish_collector.models import ProductRecord, SearchFilters
-from goofish_collector.monitor_models import MonitorTaskConfig, quiet_until
+from goofish_collector.monitor_models import MonitorTaskConfig, NotificationBatch, quiet_until
 
 
 def test_monitor_task_validates_interval_pages_and_sorting() -> None:
@@ -37,6 +37,7 @@ def test_product_record_monitor_fields_round_trip() -> None:
         chat_url="https://www.goofish.com/im?itemId=123&peerUserId=seller-1",
         first_seen_at="2026-08-04 10:00:00",
         notified_at="2026-08-04 10:01:00",
+        image_url="https://img.goofish.example/item-123.jpg",
     )
 
     restored = ProductRecord.from_dict(record.to_dict())
@@ -44,6 +45,32 @@ def test_product_record_monitor_fields_round_trip() -> None:
     assert restored.seller_id == "seller-1"
     assert restored.chat_url.endswith("peerUserId=seller-1")
     assert restored.notified_at == "2026-08-04 10:01:00"
+    assert restored.image_url == "https://img.goofish.example/item-123.jpg"
+
+
+def test_notification_batch_keeps_images_for_only_the_first_ten_items() -> None:
+    batch = NotificationBatch(
+        task_id="t1",
+        task_name="耳机",
+        provider_id="feishu",
+        items=[
+            ProductRecord(
+                keyword="耳机",
+                item_id=str(index),
+                title=f"商品 {index}",
+                url=f"https://www.goofish.com/item?id={index}",
+                image_url=f"https://img.goofish.example/{index}.jpg",
+            )
+            for index in range(11)
+        ],
+        total_count=11,
+        item_label="商品",
+    )
+
+    restored = NotificationBatch.from_dict(batch.to_dict())
+
+    assert len(restored.items) == 10
+    assert restored.items[-1].image_url == "https://img.goofish.example/9.jpg"
 
 
 def test_quiet_hours_support_daytime_and_overnight() -> None:

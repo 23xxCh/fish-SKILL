@@ -190,6 +190,7 @@ class ProductRecord:
     pages_seen: list[int] = field(default_factory=list)
     captured_at: str = ""
     raw_text: str = ""
+    image_url: str = ""
     seller_id: str = ""
     chat_url: str = ""
     first_seen_at: str = ""
@@ -222,6 +223,7 @@ class ProductRecord:
             "discount",
             "captured_at",
             "raw_text",
+            "image_url",
             "seller_id",
             "chat_url",
             "first_seen_at",

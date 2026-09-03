@@ -20,6 +20,7 @@ def test_checkpoint_round_trip(tmp_path: Path) -> None:
                 first_page=1,
                 appearances=2,
                 pages_seen=[1, 4],
+                image_url="https://img.goofish.example/item-123.jpg",
             )
         ],
     )
@@ -33,5 +34,5 @@ def test_checkpoint_round_trip(tmp_path: Path) -> None:
     assert loaded.current_page == 4
     assert loaded.raw_records == 120
     assert loaded.records[0].pages_seen == [1, 4]
+    assert loaded.records[0].image_url == "https://img.goofish.example/item-123.jpg"
     assert not store.path.with_suffix(".tmp").exists()
-

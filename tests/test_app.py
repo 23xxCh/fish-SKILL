@@ -1,12 +1,14 @@
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from PySide6.QtGui import QPalette
+from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from goofish_collector.app import MainWindow, light_palette
+from goofish_collector.app import MainWindow, SingleInstanceCoordinator, light_palette
 from goofish_collector.models import ProductRecord
 
 
@@ -16,8 +18,38 @@ def qt_app() -> QApplication:
     return app
 
 
+def _window(tmp_path: Path) -> MainWindow:
+    return MainWindow(
+        default_output_dir=tmp_path,
+        profile_dir=tmp_path / "browser-profile",
+        monitor_db_path=tmp_path / "monitor.db",
+    )
+
+
+def test_second_instance_notifies_the_first(qt_app: QApplication) -> None:
+    coordinator_name = f"goofish-collector-test-{uuid4()}"
+    first = SingleInstanceCoordinator(coordinator_name)
+    second: SingleInstanceCoordinator | None = None
+    activations: list[bool] = []
+    first.activation_requested.connect(lambda: activations.append(True))
+
+    try:
+        assert first.start() is True
+        second = SingleInstanceCoordinator(coordinator_name)
+        assert second.start() is False
+
+        client = QLocalSocket()
+        client.connectToServer(coordinator_name)
+        QTest.qWait(50)
+        assert activations == [True, True]
+    finally:
+        if second is not None:
+            second.close()
+        first.close()
+
+
 def test_window_defaults_and_config(tmp_path: Path, qt_app: QApplication) -> None:
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     window.keyword_edit.setText("  华为耳机  ")
     window.min_price_spin.setValue(100)
     window.max_price_spin.setValue(800)
@@ -47,7 +79,7 @@ def test_window_defaults_and_config(tmp_path: Path, qt_app: QApplication) -> Non
 
 
 def test_window_rejects_reversed_price_range(tmp_path: Path, qt_app: QApplication) -> None:
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     window.keyword_edit.setText("耳机")
     window.min_price_spin.setValue(900)
     window.max_price_spin.setValue(800)
@@ -58,7 +90,7 @@ def test_window_rejects_reversed_price_range(tmp_path: Path, qt_app: QApplicatio
 
 
 def test_window_rejects_blank_keyword(tmp_path: Path, qt_app: QApplication) -> None:
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     with pytest.raises(ValueError, match="关键词不能为空"):
         window.build_config()
     window.close()
@@ -68,7 +100,7 @@ def test_filter_inputs_override_dark_system_palette(
     tmp_path: Path, qt_app: QApplication
 ) -> None:
     """价格框和下拉框必须显式使用浅色，不能继承 Windows 深色主题。"""
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     style = window.styleSheet()
 
     assert "QDoubleSpinBox" in style
@@ -85,7 +117,7 @@ def test_price_inputs_accept_direct_number_typing(
     tmp_path: Path, qt_app: QApplication
 ) -> None:
     """显示“不限”时点击价格框后应能直接输入数字。"""
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     window.show()
     qt_app.processEvents()
 
@@ -107,7 +139,7 @@ def test_price_inputs_accept_direct_number_typing(
 def test_live_result_sidebar_upserts_current_task_records(
     tmp_path: Path, qt_app: QApplication
 ) -> None:
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     window.show()
     qt_app.processEvents()
 
@@ -155,7 +187,7 @@ def test_live_result_sidebar_upserts_current_task_records(
 def test_live_result_sidebar_scrolls_all_rows_and_opens_only_https_items(
     tmp_path: Path, qt_app: QApplication
 ) -> None:
-    window = MainWindow(default_output_dir=tmp_path)
+    window = _window(tmp_path)
     window.show()
     records = [
         ProductRecord(

@@ -16,6 +16,7 @@ class CardPayload:
     href: str
     anchor_text: str
     card_text: str
+    image_url: str = ""
 
 
 def parse_item_id(url: str) -> str:
@@ -37,6 +38,16 @@ def normalize_item_url(url: str) -> str:
     if category_id:
         stable["categoryId"] = category_id
     return f"https://{ITEM_HOST}{ITEM_PATH}?{urlencode(stable)}"
+
+
+def normalize_image_url(url: str) -> str:
+    try:
+        parsed = urlparse(url.strip())
+    except (AttributeError, ValueError):
+        return ""
+    if parsed.scheme != "https" or not parsed.netloc:
+        return ""
+    return parsed.geturl()
 
 
 def _parse_number(value: str) -> float | None:
@@ -129,5 +140,5 @@ def parse_card(
         pages_seen=[page],
         captured_at=captured_at,
         raw_text=raw_text,
+        image_url=normalize_image_url(payload.image_url),
     )
-

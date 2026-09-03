@@ -23,12 +23,16 @@ def test_extract_card_payloads_from_local_html() -> None:
         payloads = extract_card_payloads(page)
         browser.close()
 
-    assert len(payloads) == 2
+    assert len(payloads) == 4
     assert payloads[0].href.endswith("id=1001&categoryId=9&spm=test")
     assert payloads[0].anchor_text == "第一件商品"
     assert "¥88" in payloads[0].card_text
+    assert payloads[0].image_url == "https://img.goofish.example/item-1001.jpg"
     assert payloads[1].href.endswith("id=1002")
     assert "¥199" in payloads[1].card_text
+    assert payloads[1].image_url == "https://img.goofish.example/item-1002.jpg"
+    assert payloads[2].image_url == ""
+    assert payloads[3].image_url == ""
 
 
 @pytest.mark.parametrize(

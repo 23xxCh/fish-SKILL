@@ -5,8 +5,19 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QStandardPaths, Qt, QTimer, QUrl
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QSharedMemory,
+    QStandardPaths,
+    Qt,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPalette
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -49,6 +60,56 @@ from .workers import (
     NotificationDeliveryWorker,
     NotificationTestWorker,
 )
+
+
+class SingleInstanceCoordinator(QObject):
+    """Keeps one desktop window alive and wakes it on a repeat launch."""
+
+    activation_requested = Signal()
+
+    def __init__(self, server_name: str = "goofish-link-collector-desktop-v1") -> None:
+        super().__init__()
+        self._server_name = server_name
+        self._lock = QSharedMemory(f"{server_name}-lock", self)
+        self._server = QLocalServer(self)
+        self._is_primary = False
+
+    def start(self) -> bool:
+        if not self._lock.create(1):
+            self._notify_primary()
+            return False
+
+        if not self._server.listen(self._server_name):
+            # The process lock is ours, so an occupied endpoint is stale.
+            QLocalServer.removeServer(self._server_name)
+            if not self._server.listen(self._server_name):
+                self._lock.detach()
+                raise RuntimeError("无法创建应用单实例通道")
+        self._server.newConnection.connect(self._handle_activation_request)
+        self._is_primary = True
+        return True
+
+    def _notify_primary(self) -> None:
+        client = QLocalSocket(self)
+        client.connectToServer(self._server_name)
+        if client.waitForConnected(500):
+            client.disconnectFromServer()
+
+    def close(self) -> None:
+        self._server.close()
+        if self._is_primary:
+            QLocalServer.removeServer(self._server_name)
+            self._is_primary = False
+        if self._lock.isAttached():
+            self._lock.detach()
+
+    def _handle_activation_request(self) -> None:
+        while self._server.hasPendingConnections():
+            client = self._server.nextPendingConnection()
+            if client is not None:
+                client.disconnectFromServer()
+                client.deleteLater()
+                self.activation_requested.emit()
 
 
 def application_icon_path() -> Path:
@@ -676,7 +737,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("sectionTitle")
         dialog_layout.addWidget(title)
         hint = QLabel(
-            "定时采集每次导出 Excel 后，会向已绑定的飞书用户发送本次结果摘要和最多 10 条真实商品链接。"
+            "定时采集每次导出 Excel 后，会向已绑定的飞书用户发送本次结果摘要、最多 10 条商品主图和真实商品链接。"
         )
         hint.setObjectName("sectionHint")
         hint.setWordWrap(True)
@@ -1136,7 +1197,7 @@ class MainWindow(QMainWindow):
 
     def _scheduled_delivery_finished(self, success: bool, message: str) -> None:
         if success:
-            self._append_log("本次定时采集结果已推送至飞书。")
+            self._append_log(f"本次定时采集结果已推送至飞书：{message}")
         else:
             self._append_log(f"飞书推送失败：{message}")
 
@@ -1265,11 +1326,13 @@ class MainWindow(QMainWindow):
             "请在飞书开放平台依次完成：\n\n"
             "1. 创建企业自建应用。\n"
             "2. 开启机器人能力。\n"
-            "3. 开通 im:message 权限。\n"
+            "3. 开通 im:message 和 im:resource 权限。\n"
             "4. 事件订阅选择“使用长连接接收事件”。\n"
             "5. 添加 im.message.receive_v1 事件。\n"
             "6. 把自己加入应用可用范围。\n"
             "7. 创建并发布应用版本。\n\n"
+            "im:resource 用于上传本次推送的商品主图；未申请或未发布该权限时，"
+            "软件仍会推送文字和“查看商品”按钮。\n\n"
             "然后回到软件填写 App ID 和 App Secret，点击“开始绑定”，"
             "并在5分钟内私聊机器人发送“绑定”。",
         )
@@ -1456,9 +1519,16 @@ def main() -> int:
     app.setWindowIcon(application_icon())
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setPalette(light_palette())
+    instance = SingleInstanceCoordinator()
+    if not instance.start():
+        return 0
     window = MainWindow()
+    instance.activation_requested.connect(window._show_from_tray)
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":

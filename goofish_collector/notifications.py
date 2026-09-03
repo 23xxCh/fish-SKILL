@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import html
 import json
+import mimetypes
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
+from urllib.parse import urlparse
+from uuid import uuid4
 
 from .models import ProductRecord
 from .monitor_models import (
@@ -21,7 +24,9 @@ FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token
 FEISHU_MESSAGE_URL = (
     "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
 )
+FEISHU_IMAGE_URL = "https://open.feishu.cn/open-apis/im/v1/images"
 WXPUSHER_SIMPLE_URL = "https://wxpusher.zjiecode.com/api/send/message/simple-push"
+MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,21 @@ class JsonTransport(Protocol):
     ) -> HttpResponse: ...
 
 
+class MultipartTransport(JsonTransport, Protocol):
+    def post_multipart(
+        self,
+        url: str,
+        fields: dict[str, str],
+        *,
+        file_field: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+        headers: dict | None = None,
+        timeout: float = 15,
+    ) -> HttpResponse: ...
+
+
 class UrllibTransport:
     def post_json(
         self,
@@ -55,6 +75,52 @@ class UrllibTransport:
             url,
             data=json.dumps(data, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return HttpResponse(response.status, response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            return HttpResponse(exc.code, exc.read().decode("utf-8", "replace"))
+
+    def post_multipart(
+        self,
+        url: str,
+        fields: dict[str, str],
+        *,
+        file_field: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+        headers: dict | None = None,
+        timeout: float = 15,
+    ) -> HttpResponse:
+        boundary = f"----goofish-{uuid4().hex}"
+        body = bytearray()
+        for name, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode("ascii"))
+            body.extend(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8")
+            )
+            body.extend(value.encode("utf-8"))
+            body.extend(b"\r\n")
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{filename}"\r\n'
+            ).encode("utf-8")
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("ascii"))
+        body.extend(content)
+        body.extend(f"\r\n--{boundary}--\r\n".encode("ascii"))
+        request = urllib.request.Request(
+            url,
+            data=bytes(body),
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                **(headers or {}),
+            },
             method="POST",
         )
         try:
@@ -160,11 +226,18 @@ class WxPusherProvider:
 
 class FeishuProvider:
     provider_id = "feishu"
-    capabilities = frozenset(("button_card", "multi_link"))
+    capabilities = frozenset(("button_card", "image_card", "multi_link"))
 
-    def __init__(self, config: FeishuConfig, *, transport: JsonTransport | None = None) -> None:
+    def __init__(
+        self,
+        config: FeishuConfig,
+        *,
+        transport: MultipartTransport | None = None,
+        image_fetcher: Callable[[str], tuple[bytes, str] | None] | None = None,
+    ) -> None:
         self.config = config
         self.transport = transport or UrllibTransport()
+        self.image_fetcher = image_fetcher or self._download_image
         self._token = ""
         self._token_expires_at = 0.0
 
@@ -193,10 +266,84 @@ class FeishuProvider:
         return token
 
     @staticmethod
-    def build_card(batch: NotificationBatch) -> dict:
+    def _download_image(image_url: str) -> tuple[bytes, str] | None:
+        parsed = urlparse(image_url.strip())
+        if parsed.scheme != "https" or not parsed.netloc:
+            return None
+        request = urllib.request.Request(
+            parsed.geturl(),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.goofish.com/",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                content_type = response.headers.get_content_type().lower()
+                content_length = response.headers.get("Content-Length")
+                if content_type.startswith("image/") is False:
+                    return None
+                if content_length and int(content_length) > MAX_FEISHU_IMAGE_BYTES:
+                    return None
+                content = response.read(MAX_FEISHU_IMAGE_BYTES + 1)
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+        if not content or len(content) > MAX_FEISHU_IMAGE_BYTES:
+            return None
+        return content, content_type
+
+    def _upload_image(self, token: str, content: bytes, content_type: str) -> str:
+        if not content_type.startswith("image/"):
+            return ""
+        extension = mimetypes.guess_extension(content_type) or ".jpg"
+        response = self.transport.post_multipart(
+            FEISHU_IMAGE_URL,
+            {"image_type": "message"},
+            file_field="image",
+            filename=f"goofish-item{extension}",
+            content=content,
+            content_type=content_type,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        body = response.json()
+        if response.status_code != 200 or body.get("code") != 0:
+            return ""
+        return str((body.get("data") or {}).get("image_key") or "")
+
+    def _prepare_images(self, batch: NotificationBatch, token: str) -> tuple[dict[str, str], int]:
+        image_keys: dict[str, str] = {}
+        shown = 0
+        for item in batch.items:
+            if not item.image_url:
+                continue
+            try:
+                image = self.image_fetcher(item.image_url)
+                if image is None:
+                    continue
+                image_key = self._upload_image(token, *image)
+            except Exception:
+                continue
+            if image_key:
+                image_keys[item.key] = image_key
+                shown += 1
+        return image_keys, shown
+
+    @staticmethod
+    def build_card(batch: NotificationBatch, image_keys: dict[str, str] | None = None) -> dict:
         elements: list[dict] = []
+        image_keys = image_keys or {}
         for item in batch.items:
             details = " · ".join(part for part in (_price_text(item), item.region) if part)
+            image_key = image_keys.get(item.key)
+            if image_key:
+                elements.append(
+                    {
+                        "tag": "img",
+                        "img_key": image_key,
+                        "alt": {"tag": "plain_text", "content": item.title or "商品主图"},
+                        "mode": "fit_horizontal",
+                    }
+                )
             elements.append(
                 {
                     "tag": "div",
@@ -246,18 +393,25 @@ class FeishuProvider:
         try:
             self.validate_config()
             token = self._access_token()
+            image_keys, shown_images = self._prepare_images(batch, token)
             response = self.transport.post_json(
                 FEISHU_MESSAGE_URL,
                 {
                     "receive_id": self.config.open_id.strip(),
                     "msg_type": "interactive",
-                    "content": json.dumps(self.build_card(batch), ensure_ascii=False),
+                    "content": json.dumps(self.build_card(batch, image_keys), ensure_ascii=False),
                 },
                 {"Authorization": f"Bearer {token}"},
             )
             body = response.json()
             success = response.status_code == 200 and body.get("code") == 0
             message = str(body.get("msg") or body.get("message") or response.text)
+            if success:
+                total_images = len(batch.items)
+                message = (
+                    f"{message}；商品图片已展示 {shown_images}/{total_images}，"
+                    f"{total_images - shown_images} 条使用文字链接。"
+                )
             return DeliveryResult(
                 self.provider_id,
                 success,

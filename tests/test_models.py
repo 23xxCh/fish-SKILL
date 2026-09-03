@@ -66,6 +66,7 @@ def test_collection_merges_duplicate_product_across_pages() -> None:
         url="https://www.goofish.com/item?id=123",
         first_page=1,
         pages_seen=[1],
+        image_url="https://img.goofish.example/old.jpg",
     )
     duplicate = ProductRecord(
         keyword="耳机",
@@ -75,6 +76,7 @@ def test_collection_merges_duplicate_product_across_pages() -> None:
         price=99.0,
         first_page=2,
         pages_seen=[2],
+        image_url="https://img.goofish.example/new.jpg",
     )
 
     assert collection.add(first) is True
@@ -84,6 +86,7 @@ def test_collection_merges_duplicate_product_across_pages() -> None:
     assert merged.pages_seen == [1, 2]
     assert merged.price == 99.0
     assert merged.title == "商品新标题"
+    assert merged.image_url == "https://img.goofish.example/new.jpg"
 
 
 def test_collection_uses_normalized_url_when_item_id_is_missing() -> None:

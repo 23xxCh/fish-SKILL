@@ -107,6 +107,31 @@ def extract_card_payloads(page: Page) -> list[CardPayload]:
           const anchors = Array.from(document.querySelectorAll(selector));
           const seen = new Set();
           const rows = [];
+          const imageUrlFrom = (node) => {
+            const image = node && node.querySelector ? node.querySelector("img") : null;
+            if (!image) return "";
+            const candidates = [
+              image.currentSrc,
+              image.getAttribute("src"),
+              image.getAttribute("data-src"),
+              image.getAttribute("data-original"),
+              image.getAttribute("data-lazy-src"),
+              image.getAttribute("data-ks-lazyload"),
+              image.getAttribute("srcset"),
+            ];
+            for (let candidate of candidates) {
+              if (!candidate) continue;
+              candidate = candidate.trim();
+              if (candidate.includes(",") || candidate.includes(" ")) {
+                candidate = candidate.split(",")[0].trim().split(/\s+/)[0];
+              }
+              try {
+                const parsed = new URL(candidate, window.location.href);
+                if (parsed.protocol === "https:") return parsed.href;
+              } catch (_) {}
+            }
+            return "";
+          };
           for (const anchor of anchors) {
             let itemId = "";
             try {
@@ -120,19 +145,29 @@ def extract_card_payloads(page: Page) -> list[CardPayload]:
             const anchorText = (anchor.innerText || anchor.textContent || "").trim();
             let node = anchor;
             let bestText = anchorText;
+            let bestNode = anchor;
             for (let depth = 0; depth < 8 && node; depth += 1, node = node.parentElement) {
               const text = (node.innerText || node.textContent || "").trim();
               if (!text || text.length > 3000) continue;
               const itemLinks = node.querySelectorAll
                 ? node.querySelectorAll(selector).length
                 : 0;
-              if (text.length >= bestText.length) bestText = text;
+              if (text.length >= bestText.length) {
+                bestText = text;
+                bestNode = node;
+              }
               if (/[¥￥]\s*[\d,.]+/.test(text) && itemLinks <= 2) {
                 bestText = text;
+                bestNode = node;
                 break;
               }
             }
-            rows.push({ href: anchor.href, anchorText, cardText: bestText });
+            rows.push({
+              href: anchor.href,
+              anchorText,
+              cardText: bestText,
+              imageUrl: imageUrlFrom(bestNode),
+            });
           }
           return rows;
         }
@@ -144,6 +179,7 @@ def extract_card_payloads(page: Page) -> list[CardPayload]:
             href=str(row.get("href", "")),
             anchor_text=str(row.get("anchorText", "")),
             card_text=str(row.get("cardText", "")),
+            image_url=str(row.get("imageUrl", "")),
         )
         for row in rows
     ]

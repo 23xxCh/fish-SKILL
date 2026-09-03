@@ -21,6 +21,7 @@ def test_parse_card_extracts_visible_fields_conservatively() -> None:
             "华为 FreeClip 耳机\n95新\n原价 ¥699\n¥ 520\n"
             "3人想要\n1天内降价\n累计降价48.00元\n河南\n百分百好评"
         ),
+        image_url="https://img.goofish.example/freeclip.jpg",
     )
 
     record = parse_card(payload, keyword="耳机", page=3, captured_at="2026-08-04 10:00:00")
@@ -37,6 +38,7 @@ def test_parse_card_extracts_visible_fields_conservatively() -> None:
     assert record.discount == "累计降价48.00元"
     assert record.first_page == 3
     assert record.pages_seen == [3]
+    assert record.image_url == "https://img.goofish.example/freeclip.jpg"
 
 
 def test_parse_card_keeps_unavailable_fields_blank() -> None:
@@ -65,3 +67,16 @@ def test_parse_card_rejects_non_item_links() -> None:
 
     assert parse_card(payload, keyword="耳机", page=1, captured_at="now") is None
 
+
+def test_parse_card_keeps_only_https_product_images() -> None:
+    payload = CardPayload(
+        href="https://www.goofish.com/item?id=99",
+        anchor_text="普通商品",
+        card_text="普通商品\n¥12",
+        image_url="http://img.goofish.example/item.jpg",
+    )
+
+    record = parse_card(payload, keyword="商品", page=1, captured_at="now")
+
+    assert record is not None
+    assert record.image_url == ""
