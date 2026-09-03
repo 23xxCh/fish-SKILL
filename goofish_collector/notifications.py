@@ -83,7 +83,7 @@ def _price_text(record: ProductRecord) -> str:
 
 def _remaining_text(batch: NotificationBatch) -> str:
     remaining = max(0, batch.total_count - len(batch.items))
-    return f"另有剩余 {remaining} 件新品已保存到本机。" if remaining else ""
+    return f"另有剩余 {remaining} 件{batch.item_label}已保存到本机。" if remaining else ""
 
 
 class WxPusherProvider:
@@ -99,7 +99,10 @@ class WxPusherProvider:
             raise ValueError("WxPusher 极简推送令牌必须以 SPT_ 开头")
 
     def _payload(self, batch: NotificationBatch) -> dict:
-        rows = [f"<h3>{html.escape(batch.task_name)}：发现 {batch.total_count} 件新品</h3>"]
+        rows = [
+            f"<h3>{html.escape(batch.task_name)}：{batch.total_count} 件"
+            f"{html.escape(batch.item_label)}</h3>"
+        ]
         for index, item in enumerate(batch.items, 1):
             details = " · ".join(part for part in (_price_text(item), item.region) if part)
             rows.append(
@@ -114,7 +117,7 @@ class WxPusherProvider:
         first_url = batch.items[0].url if batch.items else "https://www.goofish.com/"
         return {
             "spt": self.config.spt.strip(),
-            "summary": f"{batch.task_name}：{batch.total_count} 件新品",
+            "summary": f"{batch.task_name}：{batch.total_count} 件{batch.item_label}",
             "content": "".join(rows),
             "contentType": 2,
             "url": first_url,
@@ -233,7 +236,7 @@ class FeishuProvider:
                 "template": "yellow",
                 "title": {
                     "tag": "plain_text",
-                    "content": f"{batch.task_name} · {batch.total_count} 件新品",
+                    "content": f"{batch.task_name} · {batch.total_count} 件{batch.item_label}",
                 },
             },
             "elements": elements,

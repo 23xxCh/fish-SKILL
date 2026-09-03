@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
-from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -14,7 +12,6 @@ from .checkpoint import CheckpointStore
 from .crawler import CrawlEngine, CrawlResult, RunControl, brief_error
 from .exporter import export_workbook
 from .models import PUBLISH_WINDOWS, SORT_MODES, CrawlConfig, SearchFilters
-from .monitor_store import default_monitor_db_path
 
 
 class UserVerificationRequired(RuntimeError):
@@ -24,7 +21,7 @@ class UserVerificationRequired(RuntimeError):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m goofish_collector",
-        description="本机闲鱼采集与监控状态查询。登录和安全验证须由用户在可见浏览器中完成。",
+        description="本机闲鱼采集。登录和安全验证须由用户在可见浏览器中完成。",
     )
     commands = parser.add_subparsers(dest="command")
 
@@ -50,8 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--brand-new", action="store_true", help="只看全新")
     collect.add_argument("--sort-mode", choices=SORT_MODES, default="综合", help="页面排序方式")
 
-    monitor = commands.add_parser("monitor-status", help="只读查询本机新品监控状态")
-    monitor.add_argument("--database", type=Path, help="本机 monitor.db 路径；默认使用应用目录")
     return parser
 
 
@@ -191,90 +186,6 @@ def run_collect(
     return summary
 
 
-def _read_only_connection(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only = ON")
-    return connection
-
-
-def read_monitor_status(database: Path | None = None) -> dict[str, Any]:
-    """Read monitor task and outbox state without initializing or changing the database."""
-    path = (database or default_monitor_db_path()).expanduser().resolve()
-    if not path.is_file():
-        return {
-            "schema_version": 1,
-            "command": "monitor-status",
-            "status": "not_initialized",
-            "database_present": False,
-            "task_count": 0,
-            "tasks": [],
-            "scan_count": 0,
-            "last_scan_at": "",
-            "outbox": {"pending": 0, "sent": 0, "failed": 0, "other": 0},
-        }
-
-    try:
-        with closing(_read_only_connection(path)) as connection:
-            task_rows = connection.execute(
-                "SELECT task_id,config_json,generation,baseline_ready,status,last_run_at,next_run_at,last_error "
-                "FROM tasks ORDER BY rowid"
-            ).fetchall()
-            tasks = []
-            for row in task_rows:
-                config = json.loads(row["config_json"])
-                tasks.append(
-                    {
-                        "task_id": row["task_id"],
-                        "name": str(config.get("name", "")),
-                        "keyword": str(config.get("keyword", "")),
-                        "enabled": bool(config.get("enabled", False)),
-                        "pages": int(config.get("pages", 0)),
-                        "interval_minutes": int(config.get("interval_minutes", 0)),
-                        "generation": int(row["generation"]),
-                        "baseline_ready": bool(row["baseline_ready"]),
-                        "status": str(row["status"]),
-                        "last_run_at": str(row["last_run_at"]),
-                        "next_run_at": str(row["next_run_at"]),
-                        "has_error": bool(row["last_error"]),
-                    }
-                )
-            scan = connection.execute(
-                "SELECT COUNT(*) AS count, COALESCE(MAX(scanned_at), '') AS last_scan_at FROM scans"
-            ).fetchone()
-            outbox = {"pending": 0, "sent": 0, "failed": 0, "other": 0}
-            for row in connection.execute("SELECT status,COUNT(*) AS count FROM outbox GROUP BY status"):
-                key = str(row["status"])
-                if key not in outbox:
-                    key = "other"
-                outbox[key] += int(row["count"])
-    except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as exc:
-        return {
-            "schema_version": 1,
-            "command": "monitor-status",
-            "status": "unavailable",
-            "database_present": True,
-            "reason": f"无法读取本机监控数据库：{brief_error(exc)}",
-            "task_count": 0,
-            "tasks": [],
-            "scan_count": 0,
-            "last_scan_at": "",
-            "outbox": {"pending": 0, "sent": 0, "failed": 0, "other": 0},
-        }
-
-    return {
-        "schema_version": 1,
-        "command": "monitor-status",
-        "status": "ok",
-        "database_present": True,
-        "task_count": len(tasks),
-        "tasks": tasks,
-        "scan_count": int(scan["count"]),
-        "last_scan_at": str(scan["last_scan_at"]),
-        "outbox": outbox,
-    }
-
-
 def _emit_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
@@ -301,9 +212,5 @@ def run_cli(argv: list[str] | None = None) -> int:
         )
         _emit_json(summary)
         return {"completed": 0, "stopped": 130, "verification_required": 2, "error": 1}[summary["status"]]
-    if args.command == "monitor-status":
-        summary = read_monitor_status(args.database)
-        _emit_json(summary)
-        return 0 if summary["status"] in ("ok", "not_initialized") else 1
     parser.print_help()
     return 2

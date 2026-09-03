@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QStandardPaths, Qt, QTime, QUrl
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QStandardPaths, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -30,28 +30,23 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStyleFactory,
     QSystemTrayIcon,
-    QTabWidget,
     QTableView,
-    QTableWidget,
-    QTableWidgetItem,
     QTextEdit,
-    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from .browser import default_profile_dir, profile_has_saved_login
 from .checkpoint import CheckpointStore
-from .models import CrawlConfig, CrawlProgress, ProductRecord, SearchFilters
-from .exporter import export_monitor_workbook
+from .models import CrawlConfig, CrawlProgress, ProductRecord, ScheduledCollectionConfig, SearchFilters
 from .feishu_binding import FeishuBindingWorker
-from .monitor_models import FeishuConfig, MonitorTaskConfig, WxPusherConfig
+from .monitor_models import FeishuConfig, NotificationBatch
 from .monitor_store import MonitorStore
-from .notifications import FeishuProvider, WxPusherProvider
+from .notifications import FeishuProvider
 from .workers import (
     CrawlWorker,
     LoginWorker,
-    MonitorSchedulerWorker,
+    NotificationDeliveryWorker,
     NotificationTestWorker,
 )
 
@@ -179,17 +174,22 @@ class MainWindow(QMainWindow):
         monitor_db_path: Path | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("闲鱼商品采集与新品监控")
+        self.setWindowTitle("闲鱼商品采集与定时推送")
         self.setWindowIcon(application_icon())
         self.resize(1160, 860)
         self.setMinimumSize(980, 740)
         self._crawl_worker: CrawlWorker | None = None
         self._login_worker: LoginWorker | None = None
         self._last_output: Path | None = None
-        self._monitor_worker: MonitorSchedulerWorker | None = None
         self._notification_test_worker: NotificationTestWorker | None = None
+        self._notification_delivery_worker: NotificationDeliveryWorker | None = None
         self._feishu_binding_worker: FeishuBindingWorker | None = None
-        self._selected_task_id = ""
+        self._scheduled_collection: ScheduledCollectionConfig | None = None
+        self._active_run_is_scheduled = False
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.setSingleShot(True)
+        self._schedule_timer.timeout.connect(self._run_scheduled_collection)
+        self._next_scheduled_at: datetime | None = None
         self._force_exit = False
         self._default_output_dir = default_output_dir or self._documents_output_dir()
         self._profile_dir = (profile_dir or default_profile_dir()).resolve()
@@ -198,12 +198,8 @@ class MainWindow(QMainWindow):
         self._refresh_login_state()
         self._set_running_state(False)
         self._load_notification_settings()
-        self._refresh_monitor_tasks()
+        self._load_scheduled_collection()
         self._setup_tray()
-        if any(
-            state.config.enabled for state in self._monitor_store.list_task_states()
-        ) or self._monitor_store.list_batches(status="pending"):
-            self._ensure_monitor_scheduler()
 
     @staticmethod
     def _documents_output_dir() -> Path:
@@ -241,9 +237,9 @@ class MainWindow(QMainWindow):
 
         header_copy = QVBoxLayout()
         header_copy.setSpacing(2)
-        title = QLabel("闲鱼商品采集与新品监控")
+        title = QLabel("闲鱼商品采集与定时推送")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("首次扫码后自动复用本机登录状态，采集结果直接导出为 WPS Excel。")
+        subtitle = QLabel("首次扫码后自动复用本机登录状态；可单次采集或按间隔采集并推送飞书。")
         subtitle.setObjectName("pageSubtitle")
         header_copy.addWidget(title)
         header_copy.addWidget(subtitle)
@@ -484,6 +480,43 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.open_button)
         sidebar_layout.addWidget(action_panel)
 
+        schedule_panel = QFrame()
+        schedule_panel.setObjectName("schedulePanel")
+        schedule_layout = QVBoxLayout(schedule_panel)
+        schedule_layout.setContentsMargins(18, 12, 18, 12)
+        schedule_layout.setSpacing(6)
+        schedule_title = QLabel("定时采集")
+        schedule_title.setObjectName("sectionTitle")
+        schedule_title.setToolTip("按当前采集条件循环执行；每次完成后推送飞书。")
+        schedule_layout.addWidget(schedule_title)
+        schedule_controls = QHBoxLayout()
+        self.schedule_interval_combo = QComboBox()
+        for minutes in (5, 10, 15, 30, 60):
+            self.schedule_interval_combo.addItem(f"{minutes} 分钟", minutes)
+        self.schedule_interval_combo.setCurrentText("30 分钟")
+        self.feishu_settings_button = QPushButton("设置飞书 / 绑定")
+        self.feishu_settings_button.clicked.connect(self._show_feishu_settings)
+        schedule_controls.addWidget(self.schedule_interval_combo)
+        schedule_controls.addWidget(self.feishu_settings_button)
+        schedule_layout.addLayout(schedule_controls)
+        self.feishu_status_label = QLabel("飞书：尚未配置")
+        self.feishu_status_label.setObjectName("sectionHint")
+        schedule_layout.addWidget(self.feishu_status_label)
+        self.schedule_status_label = QLabel("定时采集：未启动")
+        self.schedule_status_label.setObjectName("sectionHint")
+        self.schedule_status_label.setWordWrap(True)
+        schedule_layout.addWidget(self.schedule_status_label)
+        schedule_buttons = QHBoxLayout()
+        self.schedule_start_button = QPushButton("启动定时采集")
+        self.schedule_start_button.setObjectName("primaryButton")
+        self.schedule_stop_button = QPushButton("停止")
+        self.schedule_start_button.clicked.connect(self._start_scheduled_collection)
+        self.schedule_stop_button.clicked.connect(self._stop_scheduled_collection)
+        schedule_buttons.addWidget(self.schedule_start_button, 1)
+        schedule_buttons.addWidget(self.schedule_stop_button)
+        schedule_layout.addLayout(schedule_buttons)
+        sidebar_layout.addWidget(schedule_panel)
+
         self.result_panel = QFrame()
         self.result_panel.setObjectName("resultPanel")
         self.result_panel.setFixedHeight(190)
@@ -553,7 +586,7 @@ class MainWindow(QMainWindow):
             }
             QMainWindow, QScrollArea#contentScroll, QScrollArea#contentScroll > QWidget,
             QWidget#appRoot { background: #f3f5f7; border: none; }
-            QFrame#surfacePanel, QFrame#statusPanel, QFrame#actionPanel, QFrame#resultPanel,
+            QFrame#surfacePanel, QFrame#statusPanel, QFrame#actionPanel, QFrame#schedulePanel, QFrame#resultPanel,
             QFrame#logPanel, QFrame#loginPanel {
                 background: #ffffff; border: 1px solid #dbe1e8; border-radius: 12px;
             }
@@ -628,241 +661,34 @@ class MainWindow(QMainWindow):
             QPushButton#compactButton { min-height: 42px; }
             """
         )
-        self.main_tabs = QTabWidget(self)
-        self.main_tabs.setObjectName("mainTabs")
-        self.content_scroll.setParent(self.main_tabs)
-        self.main_tabs.addTab(self.content_scroll, "单次采集")
-        self.main_tabs.addTab(self._build_monitor_page(), "新品监控")
-        self.setCentralWidget(self.main_tabs)
-        self.setStyleSheet(
-            self.styleSheet()
-            + """
-            QTabWidget#mainTabs::pane { border: none; background: #f3f5f7; }
-            QTabBar::tab { min-width: 120px; min-height: 34px; padding: 4px 14px;
-                background: #e7ebef; color: #526174; font-weight: 700; }
-            QTabBar::tab:selected { background: #ffd84d; color: #172033; }
-            QTableWidget, QTableView#resultTable { background: #ffffff; alternate-background-color: #f8fafb;
-                border: 1px solid #dbe1e8; border-radius: 8px; gridline-color: #e8edf2; }
-            QHeaderView::section { background: #eef2f5; color: #465468; border: none;
-                border-bottom: 1px solid #dbe1e8; padding: 8px; font-weight: 700; }
-            """
-        )
+        self._build_feishu_dialog()
 
-    def _build_monitor_page(self) -> QScrollArea:
-        scroll = QScrollArea(self)
-        scroll.setObjectName("monitorScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        page = QWidget()
-        page.setObjectName("appRoot")
-        page.setMinimumWidth(900)
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(28, 22, 28, 24)
-        layout.setSpacing(16)
+    def _build_feishu_dialog(self) -> None:
+        self._feishu_dialog = QDialog(self)
+        self._feishu_dialog.setWindowTitle("飞书推送设置")
+        self._feishu_dialog.setWindowIcon(application_icon())
+        self._feishu_dialog.setMinimumWidth(560)
+        dialog_layout = QVBoxLayout(self._feishu_dialog)
+        dialog_layout.setContentsMargins(22, 20, 22, 20)
+        dialog_layout.setSpacing(12)
 
-        heading = QLabel("新品监控")
-        heading.setObjectName("pageTitle")
+        title = QLabel("飞书推送")
+        title.setObjectName("sectionTitle")
+        dialog_layout.addWidget(title)
         hint = QLabel(
-            "首次扫描静默建立基线，之后只把从未见过的商品发到手机；不自动联系卖家。"
+            "定时采集每次导出 Excel 后，会向已绑定的飞书用户发送本次结果摘要和最多 10 条真实商品链接。"
         )
-        hint.setObjectName("pageSubtitle")
-        layout.addWidget(heading)
-        layout.addWidget(hint)
-
-        list_panel = QFrame()
-        list_panel.setObjectName("surfacePanel")
-        list_layout = QVBoxLayout(list_panel)
-        list_layout.setContentsMargins(18, 16, 18, 18)
-        list_header = QHBoxLayout()
-        list_title = QLabel("监控任务")
-        list_title.setObjectName("sectionTitle")
-        self.monitor_summary_label = QLabel("0 个任务")
-        self.monitor_summary_label.setObjectName("sectionHint")
-        list_header.addWidget(list_title)
-        list_header.addStretch(1)
-        list_header.addWidget(self.monitor_summary_label)
-        list_layout.addLayout(list_header)
-        self.monitor_table = QTableWidget(0, 7)
-        self.monitor_table.setHorizontalHeaderLabels(
-            ["任务名称", "关键词", "状态", "间隔", "页数", "上次扫描", "下次扫描"]
-        )
-        self.monitor_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.monitor_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.monitor_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.monitor_table.setAlternatingRowColors(True)
-        self.monitor_table.verticalHeader().setVisible(False)
-        self.monitor_table.horizontalHeader().setStretchLastSection(True)
-        self.monitor_table.setMinimumHeight(180)
-        self.monitor_table.itemSelectionChanged.connect(self._load_selected_monitor_task)
-        list_layout.addWidget(self.monitor_table)
-        layout.addWidget(list_panel)
-
-        editor_panel = QFrame()
-        editor_panel.setObjectName("surfacePanel")
-        editor_layout = QVBoxLayout(editor_panel)
-        editor_layout.setContentsMargins(18, 16, 18, 18)
-        editor_layout.setSpacing(11)
-        editor_title_row = QHBoxLayout()
-        editor_title = QLabel("任务规则")
-        editor_title.setObjectName("sectionTitle")
-        self.monitor_editing_label = QLabel("新建任务")
-        self.monitor_editing_label.setObjectName("sectionHint")
-        editor_title_row.addWidget(editor_title)
-        editor_title_row.addStretch(1)
-        editor_title_row.addWidget(self.monitor_editing_label)
-        editor_layout.addLayout(editor_title_row)
-
-        identity = QGridLayout()
-        identity.setHorizontalSpacing(12)
-        identity.setVerticalSpacing(7)
-        self.monitor_name_edit = QLineEdit()
-        self.monitor_name_edit.setPlaceholderText("例如：广州 FreeClip 新品")
-        self.monitor_keyword_edit = QLineEdit()
-        self.monitor_keyword_edit.setPlaceholderText("输入一个搜索关键词")
-        for column, text in enumerate(("任务名称", "搜索关键词")):
-            label = QLabel(text)
-            label.setObjectName("fieldLabel")
-            identity.addWidget(label, 0, column)
-        identity.addWidget(self.monitor_name_edit, 1, 0)
-        identity.addWidget(self.monitor_keyword_edit, 1, 1)
-        identity.setColumnStretch(0, 1)
-        identity.setColumnStretch(1, 1)
-        editor_layout.addLayout(identity)
-
-        rule_grid = QGridLayout()
-        rule_grid.setHorizontalSpacing(10)
-        rule_grid.setVerticalSpacing(7)
-        self.monitor_min_price = OptionalPriceSpinBox()
-        self.monitor_max_price = OptionalPriceSpinBox()
-        for spin in (self.monitor_min_price, self.monitor_max_price):
-            spin.setRange(0, 100_000_000)
-            spin.setDecimals(2)
-            spin.setPrefix("¥")
-            spin.setMinimumWidth(130)
-        self.monitor_region_combo = QComboBox()
-        self.monitor_region_combo.setEditable(True)
-        self.monitor_region_combo.addItems(
-            [self.region_combo.itemText(index) for index in range(self.region_combo.count())]
-        )
-        self.monitor_publish_combo = QComboBox()
-        self.monitor_publish_combo.addItems(
-            [self.publish_combo.itemText(index) for index in range(self.publish_combo.count())]
-        )
-        self.monitor_sort_combo = QComboBox()
-        self.monitor_sort_combo.addItems(["综合", "新降价", "新发布"])
-        self.monitor_pages_combo = QComboBox()
-        self.monitor_pages_combo.addItems(["1", "2", "3"])
-        self.monitor_interval_combo = QComboBox()
-        self.monitor_interval_combo.addItems(["5", "10", "15", "30"])
-        self.monitor_interval_combo.setCurrentText("10")
-        fields = (
-            ("最低价", self.monitor_min_price),
-            ("最高价", self.monitor_max_price),
-            ("地区", self.monitor_region_combo),
-            ("发布时间", self.monitor_publish_combo),
-            ("排序", self.monitor_sort_combo),
-            ("页数", self.monitor_pages_combo),
-            ("间隔(分钟)", self.monitor_interval_combo),
-        )
-        for column, (text, widget) in enumerate(fields):
-            label = QLabel(text)
-            label.setObjectName("fieldLabel")
-            rule_grid.addWidget(label, 0, column)
-            rule_grid.addWidget(widget, 1, column)
-        rule_grid.setColumnStretch(2, 1)
-        editor_layout.addLayout(rule_grid)
-
-        conditions = QHBoxLayout()
-        conditions.setSpacing(8)
-        self.monitor_personal_checkbox = QCheckBox("个人闲置")
-        self.monitor_inspection_checkbox = QCheckBox("验货宝")
-        self.monitor_shipping_checkbox = QCheckBox("包邮")
-        self.monitor_new_checkbox = QCheckBox("全新")
-        for checkbox in (
-            self.monitor_personal_checkbox,
-            self.monitor_inspection_checkbox,
-            self.monitor_shipping_checkbox,
-            self.monitor_new_checkbox,
-        ):
-            conditions.addWidget(checkbox)
-        self.monitor_quiet_checkbox = QCheckBox("免打扰")
-        self.monitor_quiet_start = QTimeEdit(QTime(22, 0))
-        self.monitor_quiet_end = QTimeEdit(QTime(7, 0))
-        for editor in (self.monitor_quiet_start, self.monitor_quiet_end):
-            editor.setDisplayFormat("HH:mm")
-            editor.setEnabled(False)
-        self.monitor_quiet_checkbox.toggled.connect(self.monitor_quiet_start.setEnabled)
-        self.monitor_quiet_checkbox.toggled.connect(self.monitor_quiet_end.setEnabled)
-        conditions.addStretch(1)
-        conditions.addWidget(self.monitor_quiet_checkbox)
-        conditions.addWidget(self.monitor_quiet_start)
-        conditions.addWidget(QLabel("至"))
-        conditions.addWidget(self.monitor_quiet_end)
-        editor_layout.addLayout(conditions)
-
-        task_actions = QHBoxLayout()
-        self.monitor_new_button = QPushButton("新建 / 清空")
-        self.monitor_save_button = QPushButton("保存任务")
-        self.monitor_save_button.setObjectName("primaryButton")
-        self.monitor_scan_button = QPushButton("立即扫描")
-        self.monitor_toggle_button = QPushButton("启动监控")
-        self.monitor_delete_button = QPushButton("删除")
-        self.monitor_export_button = QPushButton("导出 Excel")
-        self.monitor_new_button.clicked.connect(self._clear_monitor_editor)
-        self.monitor_save_button.clicked.connect(self._save_monitor_task)
-        self.monitor_scan_button.clicked.connect(self._scan_monitor_now)
-        self.monitor_toggle_button.clicked.connect(self._toggle_monitor_task)
-        self.monitor_delete_button.clicked.connect(self._delete_monitor_task)
-        self.monitor_export_button.clicked.connect(self._export_monitor_task)
-        for button in (
-            self.monitor_new_button,
-            self.monitor_save_button,
-            self.monitor_scan_button,
-            self.monitor_toggle_button,
-            self.monitor_delete_button,
-            self.monitor_export_button,
-        ):
-            task_actions.addWidget(button)
-        editor_layout.addLayout(task_actions)
-        layout.addWidget(editor_panel)
-
-        notice_panel = QFrame()
-        notice_panel.setObjectName("surfacePanel")
-        notice_layout = QVBoxLayout(notice_panel)
-        notice_layout.setContentsMargins(18, 16, 18, 18)
-        notice_layout.setSpacing(10)
-        notice_header = QHBoxLayout()
-        notice_title = QLabel("手机通知")
-        notice_title.setObjectName("sectionTitle")
-        self.provider_combo = QComboBox()
-        self.provider_combo.addItem("飞书应用机器人（默认）", "feishu")
-        self.provider_combo.addItem("WxPusher 极简推送", "wxpusher")
-        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
-        notice_header.addWidget(notice_title)
-        notice_header.addStretch(1)
-        notice_header.addWidget(QLabel("当前通道"))
-        notice_header.addWidget(self.provider_combo)
-        notice_layout.addLayout(notice_header)
-        self.provider_hint = QLabel("一次只启用一个通道；切换不会改变已经排队的通知。")
-        self.provider_hint.setObjectName("sectionHint")
-        notice_layout.addWidget(self.provider_hint)
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        dialog_layout.addWidget(hint)
         self.feishu_setup_status = QLabel()
         self.feishu_setup_status.setObjectName("sectionHint")
         self.feishu_setup_status.setWordWrap(True)
-        notice_layout.addWidget(self.feishu_setup_status)
-        failed_row = QHBoxLayout()
-        self.failed_batch_combo = QComboBox()
-        self.failed_batch_combo.setMinimumWidth(320)
-        self.retry_failed_button = QPushButton("使用当前通道重试")
-        self.retry_failed_button.clicked.connect(self._retry_failed_batch)
-        failed_row.addWidget(QLabel("失败通知"))
-        failed_row.addWidget(self.failed_batch_combo, 1)
-        failed_row.addWidget(self.retry_failed_button)
-        notice_layout.addLayout(failed_row)
+        dialog_layout.addWidget(self.feishu_setup_status)
 
-        feishu_grid = QGridLayout()
-        feishu_grid.setHorizontalSpacing(10)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
         self.feishu_app_id_edit = QLineEdit()
         self.feishu_app_id_edit.setPlaceholderText("cli_xxx")
         self.feishu_secret_edit = QLineEdit()
@@ -870,6 +696,15 @@ class MainWindow(QMainWindow):
         self.feishu_secret_edit.setPlaceholderText("App Secret（仅加密保存在本机）")
         self.feishu_binding_label = QLabel("未绑定接收用户")
         self.feishu_binding_label.setObjectName("sectionHint")
+        grid.addWidget(QLabel("飞书 App ID"), 0, 0)
+        grid.addWidget(self.feishu_app_id_edit, 0, 1)
+        grid.addWidget(QLabel("App Secret"), 1, 0)
+        grid.addWidget(self.feishu_secret_edit, 1, 1)
+        grid.addWidget(self.feishu_binding_label, 2, 0, 1, 2)
+        grid.setColumnStretch(1, 1)
+        dialog_layout.addLayout(grid)
+
+        actions = QHBoxLayout()
         self.feishu_save_button = QPushButton("保存飞书配置")
         self.feishu_bind_button = QPushButton("开始绑定（5分钟）")
         self.feishu_unbind_button = QPushButton("解绑")
@@ -878,14 +713,8 @@ class MainWindow(QMainWindow):
         self.feishu_save_button.clicked.connect(self._save_feishu_settings)
         self.feishu_bind_button.clicked.connect(self._start_feishu_binding)
         self.feishu_unbind_button.clicked.connect(self._unbind_feishu)
-        self.feishu_test_button.clicked.connect(lambda: self._test_notification("feishu"))
+        self.feishu_test_button.clicked.connect(self._test_notification)
         self.feishu_help_button.clicked.connect(self._show_feishu_guide)
-        feishu_grid.addWidget(QLabel("飞书 App ID"), 0, 0)
-        feishu_grid.addWidget(self.feishu_app_id_edit, 0, 1)
-        feishu_grid.addWidget(QLabel("App Secret"), 0, 2)
-        feishu_grid.addWidget(self.feishu_secret_edit, 0, 3)
-        feishu_grid.addWidget(self.feishu_binding_label, 1, 0, 1, 2)
-        feishu_buttons = QHBoxLayout()
         for button in (
             self.feishu_save_button,
             self.feishu_bind_button,
@@ -893,57 +722,12 @@ class MainWindow(QMainWindow):
             self.feishu_test_button,
             self.feishu_help_button,
         ):
-            feishu_buttons.addWidget(button)
-        feishu_grid.addLayout(feishu_buttons, 1, 2, 1, 2)
-        notice_layout.addLayout(feishu_grid)
+            actions.addWidget(button)
+        dialog_layout.addLayout(actions)
 
-        divider = QFrame()
-        divider.setObjectName("divider")
-        divider.setFrameShape(QFrame.HLine)
-        notice_layout.addWidget(divider)
-        wx_row = QHBoxLayout()
-        self.wxpusher_spt_edit = QLineEdit()
-        self.wxpusher_spt_edit.setEchoMode(QLineEdit.Password)
-        self.wxpusher_spt_edit.setPlaceholderText("SPT_...（相当于私人收件地址，请勿泄露）")
-        self.wxpusher_save_button = QPushButton("保存 SPT")
-        self.wxpusher_test_button = QPushButton("测试 WxPusher")
-        self.wxpusher_reset_button = QPushButton("重置")
-        self.wxpusher_help_button = QPushButton("获取 SPT / 官方说明")
-        self.wxpusher_save_button.clicked.connect(self._save_wxpusher_settings)
-        self.wxpusher_test_button.clicked.connect(lambda: self._test_notification("wxpusher"))
-        self.wxpusher_reset_button.clicked.connect(self._reset_wxpusher)
-        self.wxpusher_help_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://wxpusher.zjiecode.com/docs/"))
-        )
-        wx_row.addWidget(QLabel("WxPusher SPT"))
-        wx_row.addWidget(self.wxpusher_spt_edit, 1)
-        for button in (
-            self.wxpusher_save_button,
-            self.wxpusher_test_button,
-            self.wxpusher_reset_button,
-            self.wxpusher_help_button,
-        ):
-            wx_row.addWidget(button)
-        notice_layout.addLayout(wx_row)
-        layout.addWidget(notice_panel)
-
-        monitor_log_panel = QFrame()
-        monitor_log_panel.setObjectName("logPanel")
-        monitor_log_layout = QVBoxLayout(monitor_log_panel)
-        monitor_log_layout.setContentsMargins(18, 14, 18, 16)
-        monitor_log_title = QLabel("监控日志")
-        monitor_log_title.setObjectName("sectionTitle")
-        self.monitor_log_view = QTextEdit()
-        self.monitor_log_view.setReadOnly(True)
-        self.monitor_log_view.setMinimumHeight(120)
-        self.monitor_log_view.setPlaceholderText("扫描、发现新品和通知结果会显示在这里。")
-        self.monitor_log_view.document().setMaximumBlockCount(1000)
-        monitor_log_layout.addWidget(monitor_log_title)
-        monitor_log_layout.addWidget(self.monitor_log_view)
-        layout.addWidget(monitor_log_panel)
-        layout.addStretch(1)
-        scroll.setWidget(page)
-        return scroll
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self._feishu_dialog.close)
+        dialog_layout.addWidget(close_button)
 
     def build_config(self) -> CrawlConfig:
         keyword = self.keyword_edit.text().strip()
@@ -1018,16 +802,137 @@ class MainWindow(QMainWindow):
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.append(f"[{stamp}] {message}")
 
+    def _load_scheduled_collection(self) -> None:
+        saved = self._monitor_store.load_scheduled_collection()
+        if saved is None:
+            self._update_schedule_ui()
+            return
+        self._scheduled_collection = saved
+        self._apply_scheduled_config_to_form(saved.crawl_config)
+        self.schedule_interval_combo.setCurrentText(f"{saved.interval_minutes} 分钟")
+        self._update_schedule_ui()
+        if saved.enabled:
+            self._schedule_next_run(log_message=False)
+
+    def _apply_scheduled_config_to_form(self, config: CrawlConfig) -> None:
+        self.keyword_edit.setText(config.keyword)
+        self.max_pages_spin.setValue(config.max_pages)
+        self.max_items_spin.setValue(config.max_items)
+        self.output_edit.setText(str(config.output_dir))
+        self.min_price_spin.setValue(config.filters.min_price or 0)
+        self.max_price_spin.setValue(config.filters.max_price or 0)
+        self.region_combo.setCurrentText(config.filters.region or "全国")
+        self.publish_combo.setCurrentText(config.filters.published_within or "不限")
+        self.personal_checkbox.setChecked(config.filters.personal_only)
+        self.inspection_checkbox.setChecked(config.filters.inspection_only)
+        self.free_shipping_checkbox.setChecked(config.filters.free_shipping)
+        self.brand_new_checkbox.setChecked(config.filters.brand_new)
+
+    def _save_scheduled_collection(self, *, enabled: bool) -> ScheduledCollectionConfig:
+        config = ScheduledCollectionConfig(
+            crawl_config=self.build_config(),
+            interval_minutes=int(self.schedule_interval_combo.currentData()),
+            enabled=enabled,
+        )
+        self._monitor_store.save_scheduled_collection(config)
+        self._scheduled_collection = config
+        self._update_schedule_ui()
+        return config
+
+    def _start_scheduled_collection(self) -> None:
+        if self._is_crawling() or (
+            self._login_worker is not None and self._login_worker.isRunning()
+        ):
+            QMessageBox.information(self, "浏览器正在使用", "请等待当前采集或登录结束后再启动定时采集。")
+            return
+        try:
+            scheduled = self._save_scheduled_collection(enabled=True)
+            FeishuProvider(self._monitor_store.load_feishu_config()).validate_config()
+        except ValueError as exc:
+            self._stop_scheduled_collection(show_message=False)
+            QMessageBox.warning(
+                self,
+                "飞书尚未就绪",
+                f"{exc}\n请先点击“设置飞书 / 绑定”完成配置和测试。",
+            )
+            return
+        self._append_log(
+            f"已启动定时采集：每 {scheduled.interval_minutes} 分钟执行一次；现在开始首次采集。"
+        )
+        self._schedule_next_run(delay_seconds=0, log_message=False)
+
+    def _stop_scheduled_collection(self, *, show_message: bool = True) -> None:
+        self._schedule_timer.stop()
+        if self._scheduled_collection is not None:
+            disabled = ScheduledCollectionConfig(
+                crawl_config=self._scheduled_collection.crawl_config,
+                interval_minutes=self._scheduled_collection.interval_minutes,
+                enabled=False,
+            )
+            self._monitor_store.save_scheduled_collection(disabled)
+            self._scheduled_collection = disabled
+        self._next_scheduled_at = None
+        self._update_schedule_ui()
+        if show_message:
+            self._append_log("定时采集已停止；当前正在运行的采集会继续导出，但不会再推送飞书。")
+
+    def _schedule_next_run(
+        self, *, delay_seconds: int | None = None, log_message: bool = True
+    ) -> None:
+        scheduled = self._scheduled_collection
+        if scheduled is None or not scheduled.enabled:
+            self._update_schedule_ui()
+            return
+        delay = delay_seconds
+        if delay is None:
+            delay = scheduled.interval_minutes * 60
+        self._next_scheduled_at = datetime.now().replace(microsecond=0)
+        self._next_scheduled_at = self._next_scheduled_at + timedelta(seconds=delay)
+        self._schedule_timer.start(max(0, delay) * 1000)
+        self._update_schedule_ui()
+        if log_message:
+            self._append_log(
+                f"下次定时采集：{self._next_scheduled_at.strftime('%H:%M')}。"
+            )
+
+    def _run_scheduled_collection(self) -> None:
+        scheduled = self._scheduled_collection
+        if scheduled is None or not scheduled.enabled:
+            return
+        if self._is_crawling() or (
+            self._login_worker is not None and self._login_worker.isRunning()
+        ):
+            self._schedule_next_run(delay_seconds=30, log_message=False)
+            return
+        self._next_scheduled_at = None
+        self._update_schedule_ui()
+        self._append_log(f"定时采集开始：关键词“{scheduled.crawl_config.keyword}”。")
+        self._start_crawl(config=scheduled.crawl_config, scheduled=True)
+
+    def _update_schedule_ui(self) -> None:
+        scheduled = self._scheduled_collection
+        enabled = bool(scheduled and scheduled.enabled)
+        self.schedule_interval_combo.setEnabled(not self._is_crawling() and not enabled)
+        self.schedule_start_button.setEnabled(not self._is_crawling() and not enabled)
+        self.schedule_stop_button.setEnabled(enabled)
+        if not enabled:
+            self.schedule_status_label.setText("定时采集：未启动")
+        elif self._is_crawling():
+            self.schedule_status_label.setText("定时采集：本次正在执行")
+        elif self._next_scheduled_at is not None:
+            self.schedule_status_label.setText(
+                f"定时采集：已启动，下次 {self._next_scheduled_at.strftime('%H:%M')}"
+            )
+        else:
+            self.schedule_status_label.setText("定时采集：已启动，等待执行")
+
     def _start_login(self) -> None:
         if self._login_worker is not None and self._login_worker.isRunning():
             return
-        if not self._suspend_monitor_scheduler():
-            QMessageBox.warning(
-                self,
-                "监控正在结束当前扫描",
-                "请稍后再打开登录窗口，避免两个 Edge 同时占用专用登录目录。",
-            )
+        if self._is_crawling():
+            QMessageBox.information(self, "采集正在运行", "请先停止当前采集后再打开登录窗口。")
             return
+        self._schedule_timer.stop()
         if self._refresh_login_state():
             self._append_log("正在打开已保存的闲鱼账号；需要时可在浏览器中切换账号。")
         else:
@@ -1052,19 +957,19 @@ class MainWindow(QMainWindow):
         if self._login_worker is not None:
             self._login_worker.deleteLater()
             self._login_worker = None
-        if any(
-            state.config.enabled for state in self._monitor_store.list_task_states()
-        ) or self._monitor_store.list_batches(status="pending"):
-            self._ensure_monitor_scheduler()
+        self._schedule_next_run(log_message=False)
 
-    def _start_crawl(self) -> None:
+    def _start_crawl(
+        self, *, config: CrawlConfig | None = None, scheduled: bool = False
+    ) -> None:
         if self._is_crawling():
             return
-        try:
-            config = self.build_config()
-        except ValueError as exc:
-            QMessageBox.warning(self, "输入有误", str(exc))
-            return
+        if config is None:
+            try:
+                config = self.build_config()
+            except ValueError as exc:
+                QMessageBox.warning(self, "输入有误", str(exc))
+                return
 
         store = CheckpointStore.for_config(config)
         resume = False
@@ -1074,7 +979,11 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(self, "检查点损坏", f"无法读取上次进度：{exc}")
                 return
-            if checkpoint is not None and checkpoint.config == config:
+            if scheduled:
+                resume = checkpoint is not None and checkpoint.config == config
+                if not resume:
+                    store.delete()
+            elif checkpoint is not None and checkpoint.config == config:
                 answer = QMessageBox.question(
                     self,
                     "发现未完成任务",
@@ -1100,21 +1009,17 @@ class MainWindow(QMainWindow):
                     return
                 store.delete()
 
-        if not self._suspend_monitor_scheduler():
-            QMessageBox.warning(
-                self,
-                "监控正在结束当前扫描",
-                "请稍后再开始单次采集，避免两个 Edge 同时占用专用登录目录。",
-            )
-            return
+        self._schedule_timer.stop()
         self._last_output = None
+        self._active_run_is_scheduled = scheduled
         self._clear_result_records()
         self.page_value.setText("0")
         self.raw_value.setText("0")
         self.unique_value.setText("0")
         self.status_value.setText("启动中")
+        run_name = "定时任务" if scheduled else "开始任务"
         self._append_log(
-            f"开始任务：关键词“{config.keyword}”，最多 {config.max_pages} 页，"
+            f"{run_name}：关键词“{config.keyword}”，最多 {config.max_pages} 页，"
             f"商品上限 {'不限' if config.max_items == 0 else config.max_items}。"
         )
         if config.filters.is_active:
@@ -1185,22 +1090,66 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self._append_log("已请求停止；当前浏览器操作结束后会导出已有结果。")
 
-    def _crawl_succeeded(self, output: str, reason: str, count: int) -> None:
+    def _crawl_succeeded(
+        self, output: str, reason: str, count: int, records: list[ProductRecord]
+    ) -> None:
         self._last_output = Path(output)
         self.status_value.setText(reason)
         self.unique_value.setText(f"{count:,}")
         self._append_log(f"任务结束：{reason}。已导出 {count:,} 条唯一商品。")
         self._append_log(f"Excel：{output}")
         self.open_button.setEnabled(True)
+        if self._active_run_is_scheduled:
+            if not reason.startswith(("用户停止", "运行错误")):
+                self._push_scheduled_results(records)
+            return
         if reason.startswith("运行错误"):
             QMessageBox.warning(self, "任务部分完成", f"{reason}\n已导出当前结果。")
         else:
             QMessageBox.information(self, "采集完成", f"已导出 {count:,} 条商品链接。")
 
+    def _push_scheduled_results(self, records: list[ProductRecord]) -> None:
+        scheduled = self._scheduled_collection
+        if scheduled is None or not scheduled.enabled:
+            return
+        if (
+            self._notification_delivery_worker is not None
+            and self._notification_delivery_worker.isRunning()
+        ):
+            self._append_log("上一条飞书推送仍在发送，本次结果未重复推送。")
+            return
+        batch = NotificationBatch(
+            task_id="scheduled_collection",
+            task_name=f"定时采集：{scheduled.crawl_config.keyword}",
+            provider_id="feishu",
+            items=records,
+            total_count=len(records),
+            item_label="商品",
+        )
+        worker = NotificationDeliveryWorker(
+            FeishuProvider(self._monitor_store.load_feishu_config()), batch
+        )
+        self._notification_delivery_worker = worker
+        worker.completed.connect(self._scheduled_delivery_finished)
+        worker.finished.connect(self._scheduled_delivery_thread_finished)
+        worker.start()
+
+    def _scheduled_delivery_finished(self, success: bool, message: str) -> None:
+        if success:
+            self._append_log("本次定时采集结果已推送至飞书。")
+        else:
+            self._append_log(f"飞书推送失败：{message}")
+
+    def _scheduled_delivery_thread_finished(self) -> None:
+        if self._notification_delivery_worker is not None:
+            self._notification_delivery_worker.deleteLater()
+            self._notification_delivery_worker = None
+
     def _crawl_failed(self, message: str) -> None:
         self.status_value.setText("任务失败")
         self._append_log(f"任务失败：{message}")
-        QMessageBox.critical(self, "任务失败", message)
+        if not self._active_run_is_scheduled:
+            QMessageBox.critical(self, "任务失败", message)
 
     def _crawl_thread_finished(self) -> None:
         self._set_running_state(False)
@@ -1208,10 +1157,8 @@ class MainWindow(QMainWindow):
         if self._crawl_worker is not None:
             self._crawl_worker.deleteLater()
             self._crawl_worker = None
-        if any(
-            state.config.enabled for state in self._monitor_store.list_task_states()
-        ) or self._monitor_store.list_batches(status="pending"):
-            self._ensure_monitor_scheduler()
+        self._active_run_is_scheduled = False
+        self._schedule_next_run(log_message=False)
 
     def _open_output(self) -> None:
         if self._last_output is None or not self._last_output.exists():
@@ -1242,372 +1189,37 @@ class MainWindow(QMainWindow):
         self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(running)
         self.open_button.setEnabled(not running and self._last_output is not None)
+        self.feishu_settings_button.setEnabled(not running)
+        self._update_schedule_ui()
 
-    def _append_monitor_log(self, message: str) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        self.monitor_log_view.append(f"[{stamp}] {message}")
-
-    def _monitor_filters(self) -> SearchFilters:
-        region = self.monitor_region_combo.currentText().strip()
-        filters = SearchFilters(
-            min_price=self.monitor_min_price.value() or None,
-            max_price=self.monitor_max_price.value() or None,
-            region="" if region == "全国" else region,
-            published_within=(
-                ""
-                if self.monitor_publish_combo.currentText() == "不限"
-                else self.monitor_publish_combo.currentText()
-            ),
-            personal_only=self.monitor_personal_checkbox.isChecked(),
-            inspection_only=self.monitor_inspection_checkbox.isChecked(),
-            free_shipping=self.monitor_shipping_checkbox.isChecked(),
-            brand_new=self.monitor_new_checkbox.isChecked(),
-            sort_mode=self.monitor_sort_combo.currentText(),
-        )
-        filters.validate()
-        return filters
-
-    def _build_monitor_task(self) -> MonitorTaskConfig:
-        enabled = False
-        if self._selected_task_id:
-            enabled = self._monitor_store.get_task_state(self._selected_task_id).config.enabled
-        return MonitorTaskConfig(
-            task_id=self._selected_task_id or uuid4().hex,
-            name=self.monitor_name_edit.text(),
-            keyword=self.monitor_keyword_edit.text(),
-            filters=self._monitor_filters(),
-            pages=int(self.monitor_pages_combo.currentText()),
-            interval_minutes=int(self.monitor_interval_combo.currentText()),
-            quiet_enabled=self.monitor_quiet_checkbox.isChecked(),
-            quiet_start=self.monitor_quiet_start.time().toString("HH:mm"),
-            quiet_end=self.monitor_quiet_end.time().toString("HH:mm"),
-            enabled=enabled,
-        )
-
-    def _refresh_monitor_tasks(self) -> None:
-        states = self._monitor_store.list_task_states()
-        selected = self._selected_task_id
-        self.monitor_table.blockSignals(True)
-        self.monitor_table.setRowCount(len(states))
-        status_labels = {
-            "paused": "已暂停",
-            "waiting": "监控中",
-            "running": "扫描中",
-            "error": "运行错误",
-            "needs_login": "等待登录",
-        }
-        selected_row = -1
-        for row, state in enumerate(states):
-            config = state.config
-            values = (
-                config.name,
-                config.keyword,
-                status_labels.get(state.status, state.status),
-                f"{config.interval_minutes} 分钟",
-                f"{config.pages} 页",
-                state.last_run_at.replace("T", " ") or "尚未扫描",
-                state.next_run_at.replace("T", " ") or ("等待调度" if config.enabled else "—"),
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.UserRole, config.task_id)
-                self.monitor_table.setItem(row, column, item)
-            if config.task_id == selected:
-                selected_row = row
-        self.monitor_table.resizeColumnsToContents()
-        self.monitor_table.blockSignals(False)
-        enabled_count = sum(1 for state in states if state.config.enabled)
-        self.monitor_summary_label.setText(
-            f"{len(states)} 个任务 · {enabled_count} 个正在监控"
-        )
-        if selected_row >= 0:
-            self.monitor_table.selectRow(selected_row)
-        elif selected and not any(state.config.task_id == selected for state in states):
-            self._clear_monitor_editor()
-
-    def _load_selected_monitor_task(self) -> None:
-        row = self.monitor_table.currentRow()
-        if row < 0:
-            return
-        item = self.monitor_table.item(row, 0)
-        task_id = str(item.data(Qt.UserRole) or "") if item else ""
-        if not task_id:
-            return
-        state = self._monitor_store.get_task_state(task_id)
-        config = state.config
-        self._selected_task_id = task_id
-        self.monitor_editing_label.setText(f"正在编辑：{config.name}")
-        self.monitor_name_edit.setText(config.name)
-        self.monitor_keyword_edit.setText(config.keyword)
-        self.monitor_min_price.setValue(config.filters.min_price or 0)
-        self.monitor_max_price.setValue(config.filters.max_price or 0)
-        self.monitor_region_combo.setCurrentText(config.filters.region or "全国")
-        self.monitor_publish_combo.setCurrentText(config.filters.published_within or "不限")
-        self.monitor_sort_combo.setCurrentText(config.filters.sort_mode)
-        self.monitor_pages_combo.setCurrentText(str(config.pages))
-        self.monitor_interval_combo.setCurrentText(str(config.interval_minutes))
-        self.monitor_personal_checkbox.setChecked(config.filters.personal_only)
-        self.monitor_inspection_checkbox.setChecked(config.filters.inspection_only)
-        self.monitor_shipping_checkbox.setChecked(config.filters.free_shipping)
-        self.monitor_new_checkbox.setChecked(config.filters.brand_new)
-        self.monitor_quiet_checkbox.setChecked(config.quiet_enabled)
-        self.monitor_quiet_start.setTime(QTime.fromString(config.quiet_start, "HH:mm"))
-        self.monitor_quiet_end.setTime(QTime.fromString(config.quiet_end, "HH:mm"))
-        self.monitor_toggle_button.setText("暂停监控" if config.enabled else "启动监控")
-
-    def _clear_monitor_editor(self) -> None:
-        self._selected_task_id = ""
-        self.monitor_table.clearSelection()
-        self.monitor_editing_label.setText("新建任务")
-        self.monitor_name_edit.clear()
-        self.monitor_keyword_edit.clear()
-        self.monitor_min_price.setValue(0)
-        self.monitor_max_price.setValue(0)
-        self.monitor_region_combo.setCurrentText("全国")
-        self.monitor_publish_combo.setCurrentText("不限")
-        self.monitor_sort_combo.setCurrentText("综合")
-        self.monitor_pages_combo.setCurrentText("1")
-        self.monitor_interval_combo.setCurrentText("10")
-        for checkbox in (
-            self.monitor_personal_checkbox,
-            self.monitor_inspection_checkbox,
-            self.monitor_shipping_checkbox,
-            self.monitor_new_checkbox,
-            self.monitor_quiet_checkbox,
-        ):
-            checkbox.setChecked(False)
-        self.monitor_quiet_start.setTime(QTime(22, 0))
-        self.monitor_quiet_end.setTime(QTime(7, 0))
-        self.monitor_toggle_button.setText("启动监控")
-
-    def _save_monitor_task(self) -> bool:
-        try:
-            task = self._build_monitor_task()
-            old_state = (
-                self._monitor_store.get_task_state(task.task_id)
-                if self._selected_task_id
-                else None
-            )
-            state = self._monitor_store.save_task(task)
-        except (ValueError, KeyError) as exc:
-            QMessageBox.warning(self, "任务规则有误", str(exc))
-            return False
-        self._selected_task_id = task.task_id
-        if old_state and old_state.config.rule_fingerprint != task.rule_fingerprint:
-            self._append_monitor_log(
-                f"任务“{task.name}”规则已修改：历史数据保留，下次扫描会静默重建基线。"
-            )
-        else:
-            self._append_monitor_log(f"任务“{task.name}”已保存。")
-        self._refresh_monitor_tasks()
-        return True
-
-    def _selected_task(self):
-        if not self._selected_task_id:
-            QMessageBox.information(self, "请选择任务", "请先在任务列表中选择一个任务。")
-            return None
-        try:
-            return self._monitor_store.get_task_state(self._selected_task_id)
-        except KeyError:
-            self._refresh_monitor_tasks()
-            return None
-
-    def _scan_monitor_now(self) -> None:
-        if self._is_crawling() or (
-            self._login_worker is not None and self._login_worker.isRunning()
-        ):
-            QMessageBox.information(
-                self,
-                "浏览器正在使用",
-                "请先完成单次采集或登录窗口，再立即扫描监控任务。",
-            )
-            return
-        if not self._selected_task_id and not self._save_monitor_task():
-            return
-        state = self._selected_task()
-        if state is None:
-            return
-        self._ensure_monitor_scheduler()
-        self._monitor_worker.request_scan(state.config.task_id)
-        self._append_monitor_log(f"已请求立即扫描“{state.config.name}”。")
-
-    def _toggle_monitor_task(self) -> None:
-        state = self._selected_task()
-        if state is None:
-            return
-        enabled = not state.config.enabled
-        updated = replace(state.config, enabled=enabled)
-        self._monitor_store.save_task(updated)
-        if enabled:
-            self._monitor_store.update_task_runtime(
-                updated.task_id, status="waiting", next_run_at=""
-            )
-            self._ensure_monitor_scheduler()
-            self._monitor_worker.wake()
-            self._append_monitor_log(f"任务“{updated.name}”已启动，将立即建立或检查基线。")
-        else:
-            self._append_monitor_log(f"任务“{updated.name}”已暂停。")
-        self._refresh_monitor_tasks()
-        self._load_selected_monitor_task()
-
-    def _delete_monitor_task(self) -> None:
-        state = self._selected_task()
-        if state is None:
-            return
-        answer = QMessageBox.question(
-            self,
-            "删除监控任务",
-            f"确定删除“{state.config.name}”吗？该任务的基线、历史商品和通知队列也会删除。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-        self._monitor_store.delete_task(state.config.task_id)
-        self._append_monitor_log(f"已删除任务“{state.config.name}”。")
-        self._clear_monitor_editor()
-        self._refresh_monitor_tasks()
-
-    def _export_monitor_task(self) -> None:
-        state = self._selected_task()
-        if state is None:
-            return
-        records = self._monitor_store.list_products(
-            state.config.task_id, all_generations=True
-        )
-        if not records:
-            QMessageBox.information(self, "暂无数据", "该任务还没有扫描到可导出的商品。")
-            return
-        try:
-            output = export_monitor_workbook(
-                state.config, records, Path(self.output_edit.text().strip())
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "导出失败", str(exc))
-            return
-        self._append_monitor_log(f"监控数据已导出：{output}")
-        QMessageBox.information(self, "导出完成", f"已导出 {len(records)} 条历史商品。")
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
-
-    def _ensure_monitor_scheduler(self) -> None:
-        if self._is_crawling() or (
-            self._login_worker is not None and self._login_worker.isRunning()
-        ):
-            return
-        if self._monitor_worker is not None and self._monitor_worker.isRunning():
-            return
-        worker = MonitorSchedulerWorker(
-            self._monitor_store, profile_dir=self._profile_dir
-        )
-        self._monitor_worker = worker
-        worker.log.connect(self._append_monitor_log)
-        worker.task_updated.connect(lambda _: self._refresh_monitor_tasks())
-        worker.verification.connect(self._monitor_verification_required)
-        worker.delivery.connect(
-            lambda _batch_id, _success, _message: self._refresh_failed_batches()
-        )
-        worker.finished.connect(lambda current=worker: self._monitor_scheduler_finished(current))
-        worker.start()
-
-    def _monitor_scheduler_finished(self, worker: MonitorSchedulerWorker) -> None:
-        worker.deleteLater()
-        if self._monitor_worker is worker:
-            self._monitor_worker = None
-
-    def _suspend_monitor_scheduler(self) -> bool:
-        worker = self._monitor_worker
-        if worker is None or not worker.isRunning():
-            return True
-        worker.stop()
-        if not worker.wait(10_000):
-            return False
-        if self._monitor_worker is worker:
-            self._monitor_worker = None
-        worker.deleteLater()
-        return True
-
-    def _monitor_verification_required(self, task_id: str) -> None:
-        try:
-            state = self._monitor_store.get_task_state(task_id)
-            self._monitor_store.update_task_runtime(task_id, status="needs_login")
-            name = state.config.name
-        except KeyError:
-            name = task_id
-        self._refresh_monitor_tasks()
-        self._append_monitor_log(
-            f"任务“{name}”需要人工登录或验证；请在已显示的 Edge 中完成后点“立即扫描”。"
-        )
-        if self.isVisible():
-            QMessageBox.information(
-                self,
-                "需要人工登录",
-                "闲鱼要求重新登录或安全验证。请在 Edge 中手动完成，再点击“立即扫描”。",
-            )
+    def _show_feishu_settings(self) -> None:
+        self._refresh_feishu_setup_status()
+        self._feishu_dialog.show()
+        self._feishu_dialog.raise_()
+        self._feishu_dialog.activateWindow()
 
     def _load_notification_settings(self) -> None:
-        provider_id = self._monitor_store.get_active_provider()
-        index = self.provider_combo.findData(provider_id)
-        self.provider_combo.blockSignals(True)
-        self.provider_combo.setCurrentIndex(max(0, index))
-        self.provider_combo.blockSignals(False)
         feishu = self._monitor_store.load_feishu_config()
-        wxpusher = self._monitor_store.load_wxpusher_config()
         self.feishu_app_id_edit.setText(feishu.app_id)
         self.feishu_secret_edit.setText(feishu.app_secret)
-        self.wxpusher_spt_edit.setText(wxpusher.spt)
         self.feishu_binding_label.setText(
             f"已绑定：…{feishu.open_id[-6:]}" if feishu.open_id else "未绑定接收用户"
         )
-        self._provider_changed()
         self._refresh_feishu_setup_status()
-        self._refresh_failed_batches()
 
     def _refresh_feishu_setup_status(self) -> None:
         config = self._monitor_store.load_feishu_config()
         if not config.app_id or not config.app_secret:
             text = "第 1 步/3：填写 App ID 和 App Secret，然后点击“保存飞书配置”。"
+            sidebar = "飞书：尚未配置"
         elif not config.open_id:
             text = "第 2 步/3：点击“开始绑定”，再在飞书私聊机器人发送“绑定”。"
+            sidebar = "飞书：待绑定接收用户"
         else:
-            text = "第 3 步/3：点击“测试飞书”，确认手机收到通知后再启动监控。"
+            text = "第 3 步/3：点击“测试飞书”，确认收到通知后再启动定时采集。"
+            sidebar = "飞书：已绑定，可推送"
         self.feishu_setup_status.setText(text)
-
-    def _provider_changed(self) -> None:
-        provider_id = self.provider_combo.currentData() or "feishu"
-        self._monitor_store.set_active_provider(str(provider_id))
-        if provider_id == "feishu":
-            self.provider_hint.setText(
-                "当前使用飞书。需开通机器人、im:message、长连接事件并发布应用版本。"
-            )
-        else:
-            self.provider_hint.setText(
-                "当前使用 WxPusher。SPT 相当于私人收件地址，泄露后别人可向你推送消息。"
-            )
-        if self._monitor_worker is not None:
-            self._monitor_worker.wake()
-
-    def _refresh_failed_batches(self) -> None:
-        batches = self._monitor_store.list_batches(status="failed")
-        self.failed_batch_combo.clear()
-        for batch in batches:
-            self.failed_batch_combo.addItem(
-                f"{batch.task_name} · {batch.total_count} 件 · {batch.last_error[:50]}",
-                batch.batch_id,
-            )
-        self.retry_failed_button.setEnabled(bool(batches))
-
-    def _retry_failed_batch(self) -> None:
-        batch_id = self.failed_batch_combo.currentData()
-        if not batch_id:
-            return
-        batch = self._monitor_store.retry_with_current_provider(str(batch_id))
-        self._append_monitor_log(
-            f"失败通知已改用当前通道 {batch.provider_id} 重新进入队列。"
-        )
-        self._refresh_failed_batches()
-        self._ensure_monitor_scheduler()
-        self._monitor_worker.wake()
+        self.feishu_status_label.setText(sidebar)
 
     def _save_feishu_settings(self, *, show_message: bool = True) -> bool:
         existing = self._monitor_store.load_feishu_config()
@@ -1623,26 +1235,8 @@ class MainWindow(QMainWindow):
         self._monitor_store.save_feishu_config(config)
         self._refresh_feishu_setup_status()
         if show_message:
-            QMessageBox.information(self, "已保存", "飞书凭证已使用 Windows DPAPI 加密保存。")
+            QMessageBox.information(self, "已保存", "飞书凭证已使用 Windows DPAPI 加密保存在本机。")
         return True
-
-    def _save_wxpusher_settings(self, *, show_message: bool = True) -> bool:
-        config = WxPusherConfig(spt=self.wxpusher_spt_edit.text().strip())
-        try:
-            WxPusherProvider(config).validate_config()
-        except ValueError as exc:
-            if show_message:
-                QMessageBox.warning(self, "SPT 无效", str(exc))
-            return False
-        self._monitor_store.save_wxpusher_config(config)
-        if show_message:
-            QMessageBox.information(self, "已保存", "SPT 已使用 Windows DPAPI 加密保存。")
-        return True
-
-    def _reset_wxpusher(self) -> None:
-        self._monitor_store.save_wxpusher_config(WxPusherConfig())
-        self.wxpusher_spt_edit.clear()
-        self._append_monitor_log("WxPusher SPT 已从本机配置中清除。")
 
     def _start_feishu_binding(self) -> None:
         if self._feishu_binding_worker is not None and self._feishu_binding_worker.isRunning():
@@ -1661,7 +1255,7 @@ class MainWindow(QMainWindow):
         self._feishu_binding_worker.finished.connect(self._feishu_binding_finished)
         self.feishu_bind_button.setEnabled(False)
         self.feishu_binding_label.setText("等待私聊机器人发送“绑定”（5分钟）")
-        self._append_monitor_log("飞书绑定窗口已开启，请在5分钟内私聊机器人发送“绑定”。")
+        self._append_log("飞书绑定窗口已开启，请在5分钟内私聊机器人发送“绑定”。")
         self._feishu_binding_worker.start()
 
     def _show_feishu_guide(self) -> None:
@@ -1683,17 +1277,17 @@ class MainWindow(QMainWindow):
     def _feishu_bound(self, open_id: str) -> None:
         self.feishu_binding_label.setText(f"已绑定：…{open_id[-6:]}")
         self._refresh_feishu_setup_status()
-        self._append_monitor_log("飞书接收用户绑定成功。")
+        self._append_log("飞书接收用户绑定成功。")
         QMessageBox.information(self, "绑定成功", "飞书机器人已绑定到这台电脑。")
 
     def _feishu_binding_failed(self, message: str) -> None:
         self.feishu_binding_label.setText("绑定失败")
-        self._append_monitor_log(f"飞书绑定失败：{message}")
+        self._append_log(f"飞书绑定失败：{message}")
         QMessageBox.warning(self, "飞书绑定失败", message)
 
     def _feishu_binding_expired(self) -> None:
         self.feishu_binding_label.setText("绑定窗口已过期")
-        self._append_monitor_log("飞书绑定窗口已过期，请重新开始绑定。")
+        self._append_log("飞书绑定窗口已过期，请重新开始绑定。")
 
     def _feishu_binding_finished(self) -> None:
         self.feishu_bind_button.setEnabled(True)
@@ -1706,49 +1300,34 @@ class MainWindow(QMainWindow):
         self._monitor_store.save_feishu_config(replace(config, open_id=""))
         self.feishu_binding_label.setText("未绑定接收用户")
         self._refresh_feishu_setup_status()
-        self._append_monitor_log("飞书接收用户已解绑。")
+        self._append_log("飞书接收用户已解绑。")
 
-    def _test_notification(self, provider_id: str) -> None:
+    def _test_notification(self) -> None:
         if self._notification_test_worker is not None and self._notification_test_worker.isRunning():
             return
-        if provider_id == "feishu":
-            if not self._save_feishu_settings(show_message=False):
-                QMessageBox.warning(self, "配置不完整", "请先填写并保存飞书配置。")
-                return
-            provider = FeishuProvider(self._monitor_store.load_feishu_config())
-            button = self.feishu_test_button
-        else:
-            if not self._save_wxpusher_settings(show_message=False):
-                QMessageBox.warning(self, "配置不完整", "请输入有效的 SPT_ 令牌。")
-                return
-            provider = WxPusherProvider(self._monitor_store.load_wxpusher_config())
-            button = self.wxpusher_test_button
-        button.setEnabled(False)
-        self._notification_test_worker = NotificationTestWorker(provider)
-        self._notification_test_worker.completed.connect(
-            lambda success, message, selected=provider_id: self._notification_test_finished(
-                selected, success, message
-            )
+        if not self._save_feishu_settings(show_message=False):
+            QMessageBox.warning(self, "配置不完整", "请先填写并保存飞书配置。")
+            return
+        self.feishu_test_button.setEnabled(False)
+        self._notification_test_worker = NotificationTestWorker(
+            FeishuProvider(self._monitor_store.load_feishu_config())
         )
+        self._notification_test_worker.completed.connect(self._notification_test_finished)
         self._notification_test_worker.finished.connect(
             self._notification_test_thread_finished
         )
         self._notification_test_worker.start()
 
-    def _notification_test_finished(
-        self, provider_id: str, success: bool, message: str
-    ) -> None:
-        label = "飞书" if provider_id == "feishu" else "WxPusher"
+    def _notification_test_finished(self, success: bool, message: str) -> None:
         if success:
-            self._append_monitor_log(f"{label}测试通知发送成功。")
-            QMessageBox.information(self, "测试成功", f"{label}测试通知已发送。")
+            self._append_log("飞书测试通知发送成功。")
+            QMessageBox.information(self, "测试成功", "飞书测试通知已发送。")
         else:
-            self._append_monitor_log(f"{label}测试通知失败：{message}")
+            self._append_log(f"飞书测试通知失败：{message}")
             QMessageBox.warning(self, "测试失败", message)
 
     def _notification_test_thread_finished(self) -> None:
         self.feishu_test_button.setEnabled(True)
-        self.wxpusher_test_button.setEnabled(True)
         if self._notification_test_worker is not None:
             self._notification_test_worker.deleteLater()
             self._notification_test_worker = None
@@ -1758,7 +1337,7 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self._tray = QSystemTrayIcon(application_icon(), self)
-        self._tray.setToolTip("闲鱼新品监控")
+        self._tray.setToolTip("闲鱼定时采集与飞书推送")
         menu = self._tray.contextMenu()
         if menu is None:
             from PySide6.QtWidgets import QMenu
@@ -1797,34 +1376,40 @@ class MainWindow(QMainWindow):
             and not self._notification_test_worker.wait(16_000)
         ):
             return False
-        if self._monitor_worker is not None and self._monitor_worker.isRunning():
-            self._monitor_worker.stop()
-            if not self._monitor_worker.wait(8_000):
-                return False
+        if (
+            self._notification_delivery_worker is not None
+            and self._notification_delivery_worker.isRunning()
+            and not self._notification_delivery_worker.wait(16_000)
+        ):
+            return False
         if self._feishu_binding_worker is not None and self._feishu_binding_worker.isRunning():
             self._feishu_binding_worker.stop()
-            self._feishu_binding_worker.wait(3_000)
+            if not self._feishu_binding_worker.wait(3_000):
+                return False
         return True
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        has_enabled_monitors = any(
-            state.config.enabled for state in self._monitor_store.list_task_states()
+        scheduled_enabled = bool(
+            self._scheduled_collection and self._scheduled_collection.enabled
         )
         if (
             not self._force_exit
-            and has_enabled_monitors
+            and scheduled_enabled
             and self._tray is not None
             and self._tray.isVisible()
         ):
             self.hide()
             self._tray.showMessage(
-                "闲鱼新品监控仍在运行",
-                "窗口已缩到系统托盘。需要完全退出时，请右键托盘图标选择“退出软件”。",
+                "闲鱼定时采集仍在运行",
+                "窗口已缩到系统托盘。电脑需要保持开机；要完全退出请右键托盘图标选择“退出软件”。",
                 QSystemTrayIcon.Information,
                 4_000,
             )
             event.ignore()
             return
+        self._schedule_timer.stop()
+        if self._force_exit and scheduled_enabled:
+            self._stop_scheduled_collection(show_message=False)
         if self._is_crawling():
             answer = QMessageBox.question(
                 self,
@@ -1846,7 +1431,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         if not self._stop_background_workers():
-            QMessageBox.warning(self, "正在停止监控", "浏览器仍在结束当前操作，请稍后再退出。")
+            QMessageBox.warning(self, "正在结束后台任务", "飞书推送或绑定仍在结束，请稍后再退出。")
             event.ignore()
             return
         if self._login_worker is not None and self._login_worker.isRunning():
@@ -1866,7 +1451,7 @@ def main() -> int:
 
         return run_self_test()
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("闲鱼商品采集与新品监控")
+    app.setApplicationName("闲鱼商品采集与定时推送")
     app.setOrganizationName("Local")
     app.setWindowIcon(application_icon())
     app.setStyle(QStyleFactory.create("Fusion"))

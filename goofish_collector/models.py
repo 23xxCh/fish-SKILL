@@ -138,6 +138,39 @@ class CrawlConfig:
         )
 
 
+SCHEDULE_INTERVALS = (5, 10, 15, 30, 60)
+
+
+@dataclass(frozen=True)
+class ScheduledCollectionConfig:
+    """The persisted, single collection rule that is safe to run from the tray."""
+
+    crawl_config: CrawlConfig
+    interval_minutes: int = 30
+    enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if self.interval_minutes not in SCHEDULE_INTERVALS:
+            raise ValueError("定时采集间隔只能选择 5、10、15、30 或 60 分钟")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "crawl_config": self.crawl_config.to_dict(),
+            "interval_minutes": self.interval_minutes,
+            "enabled": self.enabled,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ScheduledCollectionConfig | None:
+        if not data or not data.get("crawl_config"):
+            return None
+        return cls(
+            crawl_config=CrawlConfig.from_dict(data["crawl_config"]),
+            interval_minutes=int(data.get("interval_minutes", 30)),
+            enabled=bool(data.get("enabled", False)),
+        )
+
+
 @dataclass
 class ProductRecord:
     keyword: str

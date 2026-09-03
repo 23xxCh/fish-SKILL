@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goofish-link-collector"
-version = "0.6.1"
-description = "Windows desktop collector and local new-item monitor for Goofish"
+version = "0.7.0"
+description = "Windows desktop collector with timed collection and Feishu pushes for Goofish"
 requires-python = ">=3.13"
 dependencies = [
   "openpyxl>=3.1,<4",

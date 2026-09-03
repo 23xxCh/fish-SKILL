@@ -134,6 +134,7 @@ class NotificationBatch:
     status: str = "pending"
     last_error: str = ""
     merge_key: str = ""
+    item_label: str = "新品"
 
     def __post_init__(self) -> None:
         if self.provider_id not in ("feishu", "wxpusher"):
@@ -141,6 +142,7 @@ class NotificationBatch:
         if self.total_count < len(self.items):
             raise ValueError("新品总数不能小于消息商品数")
         self.items = list(self.items[:10])
+        self.item_label = self.item_label.strip() or "商品"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

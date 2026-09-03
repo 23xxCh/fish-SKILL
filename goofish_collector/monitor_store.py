@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .models import ProductRecord
+from .models import ProductRecord, ScheduledCollectionConfig
 from .monitor_models import (
     FeishuConfig,
     MonitorTaskConfig,
@@ -340,6 +340,21 @@ class MonitorStore:
             app_secret=unprotect_text(self._get_setting("feishu_app_secret")),
             open_id=unprotect_text(self._get_setting("feishu_open_id")),
         )
+
+    def save_scheduled_collection(self, config: ScheduledCollectionConfig) -> None:
+        self._set_setting(
+            "scheduled_collection",
+            json.dumps(config.to_dict(), ensure_ascii=False, sort_keys=True),
+        )
+
+    def load_scheduled_collection(self) -> ScheduledCollectionConfig | None:
+        raw = self._get_setting("scheduled_collection")
+        if not raw:
+            return None
+        try:
+            return ScheduledCollectionConfig.from_dict(json.loads(raw))
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return None
 
     def save_wxpusher_config(self, config: WxPusherConfig) -> None:
         self._set_setting("wxpusher_spt", protect_text(config.spt.strip()))

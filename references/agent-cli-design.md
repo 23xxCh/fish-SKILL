@@ -7,7 +7,6 @@ Expose the existing local, visible-browser collector through a small command-lin
 ## Commands
 
 - `python -m goofish_collector collect`: accepts a keyword, page/item limits, supported visible-page filters, and an output directory. It reuses `GoofishBrowserSession` and the existing local browser profile.
-- `python -m goofish_collector monitor-status`: reads the existing monitor SQLite database with a read-only connection and returns task and outbox counts. It does not start scanning or send notifications.
 
 ## Result contract
 
@@ -19,5 +18,5 @@ Login, CAPTCHA, and risk controls remain human steps. In an interactive terminal
 
 - Parser/configuration tests cover supported command arguments and filters.
 - A fake browser session verifies structured collection output without a live Xianyu session.
-- A temporary monitor database verifies that status reads do not create a missing database or expose provider secrets.
+- UI tests verify that the saved timed-collection rule contains the current visible collection settings and that the scheduled first run is correctly dispatched without launching a real browser.
 - The existing full test suite, compile check, and package self-test remain green.

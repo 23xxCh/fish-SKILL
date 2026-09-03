@@ -6,9 +6,6 @@ from pathlib import Path
 import goofish_collector
 
 from goofish_collector import cli
-from goofish_collector.monitor_models import MonitorTaskConfig, NotificationBatch
-from goofish_collector.monitor_store import MonitorStore
-from goofish_collector.models import ProductRecord
 from goofish_collector.parser import CardPayload
 
 
@@ -112,57 +109,3 @@ def test_collect_writes_machine_readable_summary(tmp_path: Path) -> None:
     summary_path = Path(summary["summary_json"])
     assert summary_path.is_file()
     assert json.loads(summary_path.read_text(encoding="utf-8"))["output_xlsx"] == summary["output_xlsx"]
-
-
-def _record(item_id: str) -> ProductRecord:
-    return ProductRecord(
-        keyword="相机",
-        item_id=item_id,
-        title=f"商品 {item_id}",
-        url=f"https://www.goofish.com/item?id={item_id}",
-    )
-
-
-def test_monitor_status_is_read_only_and_excludes_notification_secrets(tmp_path: Path) -> None:
-    read_monitor_status = getattr(cli, "read_monitor_status", None)
-    assert callable(read_monitor_status)
-    missing = tmp_path / "missing.db"
-    assert read_monitor_status(missing)["status"] == "not_initialized"
-    assert not missing.exists()
-
-    database = tmp_path / "monitor.db"
-    store = MonitorStore(database)
-    task = MonitorTaskConfig(name="相机新品", keyword="相机", enabled=True)
-    store.save_task(task)
-    store.enqueue_batch(
-        NotificationBatch(
-            task_id=task.task_id,
-            task_name=task.name,
-            provider_id="feishu",
-            items=[_record("1")],
-            total_count=1,
-        )
-    )
-    before = database.read_bytes()
-
-    snapshot = read_monitor_status(database)
-
-    assert database.read_bytes() == before
-    assert snapshot["status"] == "ok"
-    assert snapshot["task_count"] == 1
-    assert snapshot["tasks"][0]["name"] == "相机新品"
-    assert "last_error" not in snapshot["tasks"][0]
-    assert snapshot["tasks"][0]["has_error"] is False
-    assert snapshot["outbox"]["pending"] == 1
-    assert "app_secret" not in json.dumps(snapshot, ensure_ascii=False)
-    assert "batch_json" not in json.dumps(snapshot, ensure_ascii=False)
-
-
-def test_monitor_status_command_emits_json(capsys, tmp_path: Path) -> None:
-    exit_code = cli.run_cli(["monitor-status", "--database", str(tmp_path / "missing.db")])
-
-    result = json.loads(capsys.readouterr().out)
-
-    assert exit_code == 0
-    assert result["command"] == "monitor-status"
-    assert result["status"] == "not_initialized"
