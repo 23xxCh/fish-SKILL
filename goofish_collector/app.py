@@ -744,6 +744,10 @@ class MainWindow(QMainWindow):
         self.provider_hint = QLabel("一次只启用一个通道；切换不会改变已经排队的通知。")
         self.provider_hint.setObjectName("sectionHint")
         notice_layout.addWidget(self.provider_hint)
+        self.feishu_setup_status = QLabel()
+        self.feishu_setup_status.setObjectName("sectionHint")
+        self.feishu_setup_status.setWordWrap(True)
+        notice_layout.addWidget(self.feishu_setup_status)
         failed_row = QHBoxLayout()
         self.failed_batch_combo = QComboBox()
         self.failed_batch_combo.setMinimumWidth(320)
@@ -1432,7 +1436,18 @@ class MainWindow(QMainWindow):
             f"已绑定：…{feishu.open_id[-6:]}" if feishu.open_id else "未绑定接收用户"
         )
         self._provider_changed()
+        self._refresh_feishu_setup_status()
         self._refresh_failed_batches()
+
+    def _refresh_feishu_setup_status(self) -> None:
+        config = self._monitor_store.load_feishu_config()
+        if not config.app_id or not config.app_secret:
+            text = "第 1 步/3：填写 App ID 和 App Secret，然后点击“保存飞书配置”。"
+        elif not config.open_id:
+            text = "第 2 步/3：点击“开始绑定”，再在飞书私聊机器人发送“绑定”。"
+        else:
+            text = "第 3 步/3：点击“测试飞书”，确认手机收到通知后再启动监控。"
+        self.feishu_setup_status.setText(text)
 
     def _provider_changed(self) -> None:
         provider_id = self.provider_combo.currentData() or "feishu"
@@ -1482,6 +1497,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "配置不完整", "请填写飞书 App ID 和 App Secret。")
             return False
         self._monitor_store.save_feishu_config(config)
+        self._refresh_feishu_setup_status()
         if show_message:
             QMessageBox.information(self, "已保存", "飞书凭证已使用 Windows DPAPI 加密保存。")
         return True
@@ -1542,6 +1558,7 @@ class MainWindow(QMainWindow):
 
     def _feishu_bound(self, open_id: str) -> None:
         self.feishu_binding_label.setText(f"已绑定：…{open_id[-6:]}")
+        self._refresh_feishu_setup_status()
         self._append_monitor_log("飞书接收用户绑定成功。")
         QMessageBox.information(self, "绑定成功", "飞书机器人已绑定到这台电脑。")
 
@@ -1564,6 +1581,7 @@ class MainWindow(QMainWindow):
         config = self._monitor_store.load_feishu_config()
         self._monitor_store.save_feishu_config(replace(config, open_id=""))
         self.feishu_binding_label.setText("未绑定接收用户")
+        self._refresh_feishu_setup_status()
         self._append_monitor_log("飞书接收用户已解绑。")
 
     def _test_notification(self, provider_id: str) -> None:

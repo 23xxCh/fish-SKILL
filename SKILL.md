@@ -5,7 +5,7 @@ description: "Run and verify this local Xianyu/Goofish Windows collector for ite
 
 # Goofish Local Collector
 
-Operate this repository's local collector so the user gets either a verifiable Excel link export or a locally running new-item monitor. Work from the repository root. Use the source application for the v0.5 Agent CLI; the packaged v7 executable remains suitable only for the desktop UI.
+Operate this repository's local collector so the user gets either a verifiable Excel link export or a locally running new-item monitor. Work from the repository root. Use the source application for the v0.6 Agent CLI; the packaged v8 executable is the current desktop UI artifact.
 
 ## Boundaries
 
@@ -22,7 +22,7 @@ Confirm the repository root and intended launch artifact first. Run `python -m g
 - **Agent CLI monitor status:** run `python -m goofish_collector monitor-status`. It is read-only: it reports task state and outbox counts without scanning, notifying, or exposing credentials. `not_initialized` means no local monitor database exists yet.
 
 - **One-time export:** launch the desktop application; have the user log in; then use **单次采集** for the requested keyword, page count, limit, output directory, and filters. Report the generated `.xlsx` path and verify that it opens with non-empty HTTPS item links.
-- **New-item monitor:** configure either Feishu or WxPusher in the app with credentials entered locally by the user. Create and save a narrow task, use **立即扫描** for its silent baseline, then choose **启动监控**. The first scan normally sends no alert.
+- **New-item monitor:** configure either Feishu or WxPusher in the app with credentials entered locally by the user. For Feishu, follow the visible three-step guide: save App ID/App Secret, bind by sending “绑定”, then send and visibly receive a test notification. Create and save a narrow task, use **立即扫描** for its silent baseline, then choose **启动监控**. The first scan normally sends no alert.
 - **Diagnosis:** separate a local app failure from a live-platform change. If login expires, security verification appears, or parsing fails, stop the affected action and let the user resolve login/security visibly in Edge. Preserve the error and output path for a minimal fix.
 
 ## Completion standard

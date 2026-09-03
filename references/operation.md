@@ -13,7 +13,7 @@ For a visible source application, run `python -m goofish_collector`. If the pack
 
 ## Agent CLI
 
-Use source mode for the Agent CLI; the older packaged v7 executable does not include it.
+Use source mode for the Agent CLI. The v8 desktop executable is for the visible GUI workflow.
 
 ```powershell
 python -m goofish_collector collect --keyword "相机" --pages 2 --output-dir ".\采集结果" --min-price 100 --max-price 800 --personal-only
@@ -21,6 +21,10 @@ python -m goofish_collector monitor-status
 ```
 
 `collect` uses the same visible dedicated Edge profile as the desktop app. Its standard output is one JSON result, and it writes the same structured payload to `summary_json`. Treat `verification_required` as a request for the user to finish login or a safety page visibly; never substitute a hidden browser, a direct signed request, or copied cookies. `monitor-status` opens the database read-only and must not be used to start a scan or retry a notification.
+
+## Desktop Feishu onboarding
+
+In the desktop app’s **新品监控** page, complete the visible progress in order: save App ID/App Secret, click **开始绑定（5分钟）** and privately send `绑定` to the bot, then click **测试飞书** and verify the notification arrives on the phone. The final verification remains a human observation; a successful send response alone is not proof of phone delivery.
 
 ## One-time collection
 
