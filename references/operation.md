@@ -9,7 +9,7 @@ python -m goofish_collector --self-test
 python -m pytest -q
 ```
 
-For a visible source application, run `python -m goofish_collector`. If the packaged v7 app exists, `dist_v7\XianyuLinkCollector\XianyuLinkCollector.exe` is the preferred launch artifact.
+For a visible source application, run `python -m goofish_collector`. If the packaged v8 app exists, `dist_v8\XianyuLinkCollector\XianyuLinkCollector.exe` is the preferred launch artifact.
 
 ## Agent CLI
 
