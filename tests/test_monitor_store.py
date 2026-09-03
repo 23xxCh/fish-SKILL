@@ -3,6 +3,7 @@ from pathlib import Path
 
 from goofish_collector.models import (
     ProductRecord,
+    PushRules,
     ScheduledCollectionHealth,
     SearchFilters,
 )
@@ -147,6 +148,15 @@ def test_scheduled_health_persists_without_notification_credentials(tmp_path: Pa
     store.save_scheduled_health(health)
 
     assert store.load_scheduled_health() == health
+
+
+def test_push_rules_persist_separately_from_feishu_credentials(tmp_path: Path) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    rules = PushRules(max_price=300, include_terms=("华为",), exclude_terms=("单耳",))
+
+    store.save_push_rules(rules)
+
+    assert store.load_push_rules() == rules
 
 
 def test_scheduled_delivery_outbox_can_be_marked_sent_without_an_old_monitor_task(

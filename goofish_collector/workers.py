@@ -126,6 +126,19 @@ class NotificationDeliveryWorker(QThread):
         self.completed.emit(result.success, result.message)
 
 
+class NotificationTextWorker(QThread):
+    completed = Signal(bool, str)
+
+    def __init__(self, provider: FeishuProvider, text: str) -> None:
+        super().__init__()
+        self.provider = provider
+        self.text = text
+
+    def run(self) -> None:
+        result = self.provider.send_text(self.provider.config.open_id, self.text)
+        self.completed.emit(result.success, result.message)
+
+
 class UpdateCheckWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .models import ProductRecord, ScheduledCollectionConfig, ScheduledCollectionHealth
+from .models import ProductRecord, PushRules, ScheduledCollectionConfig, ScheduledCollectionHealth
 from .monitor_models import (
     FeishuConfig,
     MonitorTaskConfig,
@@ -360,6 +360,21 @@ class MonitorStore:
             return ScheduledCollectionConfig.from_dict(json.loads(raw))
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             return None
+
+    def save_push_rules(self, rules: PushRules) -> None:
+        self._set_setting(
+            "feishu_push_rules",
+            json.dumps(rules.to_dict(), ensure_ascii=False, sort_keys=True),
+        )
+
+    def load_push_rules(self) -> PushRules:
+        raw = self._get_setting("feishu_push_rules")
+        if not raw:
+            return PushRules()
+        try:
+            return PushRules.from_dict(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return PushRules()
 
     def save_scheduled_health(self, health: ScheduledCollectionHealth) -> None:
         self._set_setting(

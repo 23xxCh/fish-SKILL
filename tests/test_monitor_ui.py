@@ -5,7 +5,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from goofish_collector.app import MainWindow
-from goofish_collector.models import CrawlConfig, ProductRecord, ScheduledCollectionConfig
+from goofish_collector.models import CrawlConfig, ProductRecord, PushRules, ScheduledCollectionConfig
 from goofish_collector.monitor_models import FeishuConfig, NotificationBatch
 
 
@@ -137,6 +137,74 @@ def test_timed_collection_queues_the_next_feishu_batch_while_the_previous_one_is
     ]
     assert len(queued) == 2
     assert worker_type.call_count == 1
+    window.close()
+
+
+def test_manual_push_is_opt_in_and_respects_saved_push_rules(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(
+        default_output_dir=tmp_path,
+        monitor_db_path=tmp_path / "monitor.db",
+        profile_dir=tmp_path / "profile",
+    )
+    matching = ProductRecord(
+        keyword="耳机",
+        item_id="1",
+        title="华为耳机",
+        price=299,
+        url="https://www.goofish.com/item?id=1",
+    )
+    excluded = ProductRecord(
+        keyword="耳机",
+        item_id="2",
+        title="华为单耳耳机",
+        price=99,
+        url="https://www.goofish.com/item?id=2",
+    )
+    window._monitor_store.save_push_rules(
+        PushRules(max_price=300, include_terms=("华为",), exclude_terms=("单耳",))
+    )
+
+    assert not window.manual_push_checkbox.isChecked()
+    with patch("goofish_collector.app.NotificationDeliveryWorker") as worker_type:
+        window._active_run_manual_push = False
+        window._push_manual_results([matching, excluded])
+        assert worker_type.call_count == 0
+
+        window._active_run_manual_push = True
+        window._push_manual_results([matching, excluded])
+
+    pushed = worker_type.call_args.args[1]
+    assert [record.item_id for record in pushed.items] == ["1"]
+    assert pushed.task_name == "单次采集：耳机"
+    window.close()
+
+
+def test_timed_collection_failure_sends_an_immediate_feishu_alert(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(
+        default_output_dir=tmp_path,
+        monitor_db_path=tmp_path / "monitor.db",
+        profile_dir=tmp_path / "profile",
+    )
+    window._scheduled_collection = ScheduledCollectionConfig(
+        crawl_config=CrawlConfig(keyword="相机", output_dir=tmp_path), enabled=True
+    )
+    window._monitor_store.save_feishu_config(
+        FeishuConfig(app_id="cli_demo", app_secret="secret-demo", open_id="ou_demo")
+    )
+    window._active_run_is_scheduled = True
+
+    with patch("goofish_collector.app.NotificationTextWorker") as worker_type:
+        window._crawl_failed("登录状态已失效")
+
+    alert_text = worker_type.call_args.args[1]
+    assert "定时采集失败" in alert_text
+    assert "相机" in alert_text
+    assert "登录状态已失效" in alert_text
+    assert "本轮采集失败" in window.health_delivery_label.text()
     window.close()
 
 

@@ -201,6 +201,61 @@ class ScheduledCollectionHealth:
         )
 
 
+@dataclass(frozen=True)
+class PushRules:
+    """Local-only conditions that decide which collected records reach Feishu."""
+
+    max_price: float | None = None
+    include_terms: tuple[str, ...] = ()
+    exclude_terms: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.max_price is not None:
+            maximum = float(self.max_price)
+            if maximum < 0:
+                raise ValueError("最高推送价不能小于 0")
+            object.__setattr__(self, "max_price", maximum)
+        for field_name in ("include_terms", "exclude_terms"):
+            raw = getattr(self, field_name)
+            if isinstance(raw, str):
+                raw = re.split(r"[,，\n]+", raw)
+            terms: list[str] = []
+            for value in raw:
+                term = str(value).strip()
+                if term and term not in terms:
+                    terms.append(term)
+            object.__setattr__(self, field_name, tuple(terms))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_price": self.max_price,
+            "include_terms": list(self.include_terms),
+            "exclude_terms": list(self.exclude_terms),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> PushRules:
+        values = data or {}
+        return cls(
+            max_price=values.get("max_price"),
+            include_terms=values.get("include_terms") or (),
+            exclude_terms=values.get("exclude_terms") or (),
+        )
+
+    def matches(self, record: ProductRecord) -> bool:
+        if self.max_price is not None and (
+            record.price is None or record.price > self.max_price
+        ):
+            return False
+        text = f"{record.title}\n{record.raw_text}".casefold()
+        if any(term.casefold() not in text for term in self.include_terms):
+            return False
+        return not any(term.casefold() in text for term in self.exclude_terms)
+
+    def filter(self, records: Iterable[ProductRecord]) -> list[ProductRecord]:
+        return [record for record in records if self.matches(record)]
+
+
 @dataclass
 class ProductRecord:
     keyword: str

@@ -55,6 +55,7 @@ from .models import (
     CrawlConfig,
     CrawlProgress,
     ProductRecord,
+    PushRules,
     ScheduledCollectionConfig,
     ScheduledCollectionHealth,
     SearchFilters,
@@ -69,6 +70,7 @@ from .workers import (
     LoginWorker,
     NotificationDeliveryWorker,
     NotificationTestWorker,
+    NotificationTextWorker,
     UpdateCheckWorker,
     UpdatePreparationWorker,
 )
@@ -256,12 +258,15 @@ class MainWindow(QMainWindow):
         self._last_output: Path | None = None
         self._notification_test_worker: NotificationTestWorker | None = None
         self._notification_delivery_worker: NotificationDeliveryWorker | None = None
+        self._manual_delivery_workers: list[NotificationDeliveryWorker] = []
+        self._failure_alert_worker: NotificationTextWorker | None = None
         self._feishu_binding_worker: FeishuBindingWorker | None = None
         self._update_check_worker: UpdateCheckWorker | None = None
         self._update_preparation_worker: UpdatePreparationWorker | None = None
         self._update_check_is_manual = False
         self._scheduled_collection: ScheduledCollectionConfig | None = None
         self._active_run_is_scheduled = False
+        self._active_run_manual_push = False
         self._schedule_timer = QTimer(self)
         self._schedule_timer.setSingleShot(True)
         self._schedule_timer.timeout.connect(self._run_scheduled_collection)
@@ -279,6 +284,7 @@ class MainWindow(QMainWindow):
         self._set_running_state(False)
         self._load_notification_settings()
         self._load_scheduled_collection()
+        self._load_push_rules()
         self._refresh_scheduled_health_ui()
         QTimer.singleShot(0, self._deliver_scheduled_queue)
         self._setup_tray()
@@ -653,11 +659,20 @@ class MainWindow(QMainWindow):
         action_panel = QFrame()
         action_panel.setObjectName("actionPanel")
         action_layout = QVBoxLayout(action_panel)
-        action_layout.setContentsMargins(18, 17, 18, 18)
+        action_layout.setContentsMargins(18, 17, 18, 15)
         action_layout.setSpacing(10)
         action_title = QLabel("任务操作")
         action_title.setObjectName("sectionTitle")
-        action_layout.addWidget(action_title)
+        action_title_row = QHBoxLayout()
+        action_title_row.setContentsMargins(0, 0, 0, 0)
+        action_title_row.addWidget(action_title)
+        action_title_row.addStretch(1)
+        self.manual_push_checkbox = QCheckBox("完成后推送飞书")
+        self.manual_push_checkbox.setObjectName("manualPushCheckbox")
+        self.manual_push_checkbox.setFixedHeight(20)
+        self.manual_push_checkbox.setToolTip("默认关闭；本次 Excel 导出完成后才发送符合推送条件的商品。")
+        action_title_row.addWidget(self.manual_push_checkbox)
+        action_layout.addLayout(action_title_row)
 
         self.start_button = QPushButton("开始采集")
         self.start_button.setObjectName("primaryButton")
@@ -741,6 +756,28 @@ class MainWindow(QMainWindow):
         self.notify_changes_only_checkbox.setToolTip(
             "首次启用仍完整推送一轮；之后没有新增或价格变化时，只导出 Excel，不发送飞书。"
         )
+        push_rules_title = QLabel("飞书推送条件")
+        push_rules_title.setObjectName("sectionTitle")
+        self.push_max_price_spin = QDoubleSpinBox()
+        self.push_max_price_spin.setRange(0, 1_000_000)
+        self.push_max_price_spin.setDecimals(2)
+        self.push_max_price_spin.setSpecialValueText("不限")
+        self.push_max_price_spin.setPrefix("¥")
+        self.push_max_price_spin.setToolTip("开启后，价格未显示或高于此价格的商品不推送飞书。")
+        self.push_include_terms_edit = QLineEdit()
+        self.push_include_terms_edit.setPlaceholderText("必须包含，如：华为，FreeClip")
+        self.push_exclude_terms_edit = QLineEdit()
+        self.push_exclude_terms_edit.setPlaceholderText("排除，如：单耳，维修")
+        push_rules_layout = QGridLayout()
+        push_rules_layout.setContentsMargins(0, 0, 0, 0)
+        push_rules_layout.addWidget(QLabel("最高推送价"), 0, 0)
+        push_rules_layout.addWidget(self.push_max_price_spin, 0, 1)
+        push_rules_layout.addWidget(QLabel("标题必须包含"), 1, 0)
+        push_rules_layout.addWidget(self.push_include_terms_edit, 1, 1)
+        push_rules_layout.addWidget(QLabel("标题排除"), 2, 0)
+        push_rules_layout.addWidget(self.push_exclude_terms_edit, 2, 1)
+        self.save_push_rules_button = QPushButton("保存推送条件")
+        self.save_push_rules_button.clicked.connect(self._save_push_rules)
         self.health_last_success_label = QLabel("最近成功：尚无记录")
         self.health_result_label = QLabel("最近结果：—")
         self.health_delivery_label = QLabel("飞书投递：未推送")
@@ -753,6 +790,9 @@ class MainWindow(QMainWindow):
             label.setWordWrap(True)
         health_layout.addWidget(health_title)
         health_layout.addWidget(self.notify_changes_only_checkbox)
+        health_layout.addWidget(push_rules_title)
+        health_layout.addLayout(push_rules_layout)
+        health_layout.addWidget(self.save_push_rules_button)
         health_layout.addWidget(self.health_last_success_label)
         health_layout.addWidget(self.health_result_label)
         health_layout.addWidget(self.health_delivery_label)
@@ -885,6 +925,13 @@ class MainWindow(QMainWindow):
             QCheckBox:hover { background: #f1f4f7; border-color: #bdc8d4; }
             QCheckBox:checked { background: #fff8d7; border-color: #d7aa00; }
             QCheckBox::indicator { width: 16px; height: 16px; }
+            QCheckBox#manualPushCheckbox {
+                min-height: 20px; padding: 0; border: none; border-radius: 0;
+                background: transparent;
+            }
+            QCheckBox#manualPushCheckbox:hover, QCheckBox#manualPushCheckbox:checked {
+                background: transparent; border: none;
+            }
             QPushButton {
                 min-height: 42px; padding: 0 15px; border-radius: 8px;
                 border: 1px solid #bdc8d4; background: #ffffff; color: #172033;
@@ -1075,6 +1122,43 @@ class MainWindow(QMainWindow):
         self.inspection_checkbox.setChecked(config.filters.inspection_only)
         self.free_shipping_checkbox.setChecked(config.filters.free_shipping)
         self.brand_new_checkbox.setChecked(config.filters.brand_new)
+
+    def _load_push_rules(self) -> None:
+        rules = self._monitor_store.load_push_rules()
+        self.push_max_price_spin.setValue(rules.max_price or 0)
+        self.push_include_terms_edit.setText("，".join(rules.include_terms))
+        self.push_exclude_terms_edit.setText("，".join(rules.exclude_terms))
+
+    def _build_push_rules(self) -> PushRules:
+        return PushRules(
+            max_price=self.push_max_price_spin.value() or None,
+            include_terms=self.push_include_terms_edit.text(),
+            exclude_terms=self.push_exclude_terms_edit.text(),
+        )
+
+    def _save_push_rules(self, _checked: bool = False, *, show_message: bool = True) -> bool:
+        try:
+            rules = self._build_push_rules()
+        except ValueError as exc:
+            if show_message:
+                QMessageBox.warning(self, "推送条件有误", str(exc))
+            return False
+        previous = self._monitor_store.load_push_rules()
+        self._monitor_store.save_push_rules(rules)
+        if rules != previous:
+            self._monitor_store.clear_scheduled_delivery_snapshot()
+        self._append_log("飞书推送条件已保存；Excel 仍保留全部采集结果。")
+        if show_message:
+            QMessageBox.information(self, "已保存", "飞书推送条件已应用到后续采集。")
+        return True
+
+    def _filter_push_records(self, records: list[ProductRecord]) -> list[ProductRecord]:
+        selected = self._monitor_store.load_push_rules().filter(records)
+        if len(selected) != len(records):
+            self._append_log(
+                f"飞书推送条件已筛除 {len(records) - len(selected)} 条；符合条件 {len(selected)} 条。"
+            )
+        return selected
 
     def _save_scheduled_collection(self, *, enabled: bool) -> ScheduledCollectionConfig:
         previous = self._scheduled_collection
@@ -1274,6 +1358,18 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "输入有误", str(exc))
                 return
 
+        manual_push = not scheduled and self.manual_push_checkbox.isChecked()
+        if manual_push:
+            try:
+                FeishuProvider(self._monitor_store.load_feishu_config()).validate_config()
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "飞书尚未就绪",
+                    f"{exc}\n请先点击“设置飞书 / 绑定”完成配置和测试。",
+                )
+                return
+
         store = CheckpointStore.for_config(config)
         resume = False
         if store.exists():
@@ -1315,6 +1411,7 @@ class MainWindow(QMainWindow):
         self._schedule_timer.stop()
         self._last_output = None
         self._active_run_is_scheduled = scheduled
+        self._active_run_manual_push = manual_push
         self._clear_result_records()
         self.page_value.setText("0")
         self.raw_value.setText("0")
@@ -1412,17 +1509,56 @@ class MainWindow(QMainWindow):
             if not reason.startswith(("用户停止", "运行错误")):
                 self._push_scheduled_results(records)
             return
+        manual_push_started = self._push_manual_results(records)
         if reason.startswith("运行错误"):
             QMessageBox.warning(self, "任务部分完成", f"{reason}\n已导出当前结果。")
         else:
-            QMessageBox.information(self, "采集完成", f"已导出 {count:,} 条商品链接。")
+            suffix = "飞书正在推送符合条件的商品。" if manual_push_started else ""
+            QMessageBox.information(self, "采集完成", f"已导出 {count:,} 条商品链接。{suffix}")
+
+    def _push_manual_results(self, records: list[ProductRecord]) -> bool:
+        if not self._active_run_manual_push:
+            return False
+        delivery_records = self._filter_push_records(records)
+        if not delivery_records:
+            self._append_log("本次采集没有符合飞书推送条件的商品；Excel 已完整导出。")
+            return False
+        batch = NotificationBatch(
+            task_id="manual_collection",
+            task_name=f"单次采集：{records[0].keyword}" if records else "单次采集",
+            provider_id="feishu",
+            items=delivery_records,
+            total_count=len(delivery_records),
+            item_label="商品",
+        )
+        worker = NotificationDeliveryWorker(
+            FeishuProvider(self._monitor_store.load_feishu_config()), batch
+        )
+        self._manual_delivery_workers.append(worker)
+        worker.completed.connect(self._manual_delivery_finished)
+        worker.finished.connect(lambda worker=worker: self._release_manual_delivery_worker(worker))
+        worker.start()
+        self._append_log(f"正在推送本次采集的 {len(delivery_records)} 条符合条件商品到飞书。")
+        return True
+
+    def _manual_delivery_finished(self, success: bool, message: str) -> None:
+        if success:
+            self._append_log(f"本次采集结果已推送至飞书：{message}")
+        else:
+            self._append_log(f"本次采集飞书推送失败：{message}")
+
+    def _release_manual_delivery_worker(self, worker: NotificationDeliveryWorker) -> None:
+        if worker in self._manual_delivery_workers:
+            self._manual_delivery_workers.remove(worker)
+        worker.deleteLater()
 
     def _push_scheduled_results(self, records: list[ProductRecord]) -> None:
         scheduled = self._scheduled_collection
         if scheduled is None or not scheduled.enabled:
             return
+        eligible_records = self._filter_push_records(records)
         delivery_records = self._monitor_store.select_scheduled_delivery_records(
-            records,
+            eligible_records,
             changes_only=scheduled.notify_changes_only,
         )
         if not delivery_records:
@@ -1528,16 +1664,51 @@ class MainWindow(QMainWindow):
         self._append_log(f"任务失败：{message}")
         if self._active_run_is_scheduled:
             self._save_scheduled_health(last_error=message, delivery_status="本轮采集失败")
+            self._send_scheduled_failure_alert(message)
         if not self._active_run_is_scheduled:
             QMessageBox.critical(self, "任务失败", message)
 
+    def _send_scheduled_failure_alert(self, error: str) -> None:
+        if self._failure_alert_worker is not None and self._failure_alert_worker.isRunning():
+            self._append_log("上一条定时失败告警仍在发送，本次告警已记录到任务健康。")
+            return
+        scheduled = self._scheduled_collection
+        keyword = scheduled.crawl_config.keyword if scheduled is not None else "当前任务"
+        alert_text = (
+            f"定时采集失败\n关键词：{keyword}\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"原因：{error[:500]}\n请在桌面端打开“任务健康”检查。"
+        )
+        worker = NotificationTextWorker(
+            FeishuProvider(self._monitor_store.load_feishu_config()), alert_text
+        )
+        self._failure_alert_worker = worker
+        worker.completed.connect(self._scheduled_failure_alert_finished)
+        worker.finished.connect(self._release_failure_alert_worker)
+        worker.start()
+        self._append_log("正在发送定时采集失败告警到飞书。")
+
+    def _scheduled_failure_alert_finished(self, success: bool, message: str) -> None:
+        if success:
+            self._append_log(f"定时失败告警已送达飞书：{message}")
+        else:
+            self._append_log(f"定时失败告警发送失败：{message}")
+
+    def _release_failure_alert_worker(self) -> None:
+        if self._failure_alert_worker is not None:
+            self._failure_alert_worker.deleteLater()
+            self._failure_alert_worker = None
+
     def _crawl_thread_finished(self) -> None:
+        manual_push = self._active_run_manual_push
         self._set_running_state(False)
         self._refresh_login_state()
         if self._crawl_worker is not None:
             self._crawl_worker.deleteLater()
-            self._crawl_worker = None
+        self._crawl_worker = None
         self._active_run_is_scheduled = False
+        self._active_run_manual_push = False
+        if manual_push:
+            self.manual_push_checkbox.setChecked(False)
         self._schedule_next_run(log_message=False)
 
     def _open_output(self) -> None:
@@ -1565,6 +1736,11 @@ class MainWindow(QMainWindow):
         self.brand_new_checkbox.setEnabled(not running)
         self.login_button.setEnabled(not running)
         self.start_button.setEnabled(not running)
+        self.manual_push_checkbox.setEnabled(not running)
+        self.push_max_price_spin.setEnabled(not running)
+        self.push_include_terms_edit.setEnabled(not running)
+        self.push_exclude_terms_edit.setEnabled(not running)
+        self.save_push_rules_button.setEnabled(not running)
         self.pause_button.setEnabled(running)
         self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(running)
@@ -1767,6 +1943,15 @@ class MainWindow(QMainWindow):
             self._notification_delivery_worker is not None
             and self._notification_delivery_worker.isRunning()
             and not self._notification_delivery_worker.wait(16_000)
+        ):
+            return False
+        for worker in self._manual_delivery_workers:
+            if worker.isRunning() and not worker.wait(16_000):
+                return False
+        if (
+            self._failure_alert_worker is not None
+            and self._failure_alert_worker.isRunning()
+            and not self._failure_alert_worker.wait(16_000)
         ):
             return False
         if self._feishu_binding_worker is not None and self._feishu_binding_worker.isRunning():

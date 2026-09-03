@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from goofish_collector.models import CrawlConfig, ProductRecord, RecordCollection, SearchFilters
+from goofish_collector.models import (
+    CrawlConfig,
+    ProductRecord,
+    PushRules,
+    RecordCollection,
+    SearchFilters,
+)
 
 
 def test_config_normalizes_keyword_and_output_directory(tmp_path: Path) -> None:
@@ -103,3 +109,39 @@ def test_collection_uses_normalized_url_when_item_id_is_missing() -> None:
     assert collection.add(record) is True
     assert collection.add(record) is False
     assert len(collection.records) == 1
+
+
+def test_push_rules_keep_only_low_price_matching_items() -> None:
+    rules = PushRules(max_price=300, include_terms=("华为", "耳机"), exclude_terms=("单耳",))
+    records = [
+        ProductRecord(
+            keyword="耳机",
+            item_id="1",
+            title="华为 FreeClip 耳机",
+            price=299,
+            url="https://www.goofish.com/item?id=1",
+        ),
+        ProductRecord(
+            keyword="耳机",
+            item_id="2",
+            title="华为 单耳耳机",
+            price=99,
+            url="https://www.goofish.com/item?id=2",
+        ),
+        ProductRecord(
+            keyword="耳机",
+            item_id="3",
+            title="华为 FreeClip 耳机",
+            price=399,
+            url="https://www.goofish.com/item?id=3",
+        ),
+        ProductRecord(
+            keyword="耳机",
+            item_id="4",
+            title="华为 FreeClip 耳机",
+            url="https://www.goofish.com/item?id=4",
+        ),
+    ]
+
+    assert [record.item_id for record in rules.filter(records)] == ["1"]
+    assert PushRules.from_dict(rules.to_dict()) == rules

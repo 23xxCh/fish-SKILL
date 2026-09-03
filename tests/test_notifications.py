@@ -111,6 +111,26 @@ def test_feishu_refreshes_token_and_sends_card() -> None:
     assert headers["Authorization"] == "Bearer token-1"
 
 
+def test_feishu_sends_a_plain_text_failure_alert() -> None:
+    transport = FakeTransport(
+        [
+            HttpResponse(200, '{"code":0,"tenant_access_token":"token-1","expire":7200}'),
+            HttpResponse(200, '{"code":0,"msg":"success"}'),
+        ]
+    )
+    provider = FeishuProvider(
+        FeishuConfig(app_id="cli_1", app_secret="secret", open_id="ou_1"),
+        transport=transport,
+    )
+
+    result = provider.send_text("ou_1", "定时采集失败\n关键词：相机")
+
+    assert result.success
+    _, payload, _ = transport.calls[-1]
+    assert payload["msg_type"] == "text"
+    assert json.loads(payload["content"])["text"].startswith("定时采集失败")
+
+
 def test_feishu_uploads_product_image_before_card_text_and_buttons() -> None:
     transport = FakeTransport(
         [
