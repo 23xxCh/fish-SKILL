@@ -11,6 +11,7 @@ from .exporter import export_workbook
 from .models import CrawlConfig, CrawlProgress, ProductRecord
 from .monitor_models import NotificationBatch
 from .notifications import FeishuProvider
+from .updater import PreparedUpdate, UpdateInfo, UpdateService
 
 
 class LoginWorker(QThread):
@@ -123,3 +124,35 @@ class NotificationDeliveryWorker(QThread):
     def run(self) -> None:
         result = self.provider.send_batch(self.batch)
         self.completed.emit(result.success, result.message)
+
+
+class UpdateCheckWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, service: UpdateService) -> None:
+        super().__init__()
+        self.service = service
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self.service.check_for_update())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class UpdatePreparationWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, service: UpdateService, update: UpdateInfo, update_root: Path) -> None:
+        super().__init__()
+        self.service = service
+        self.update = update
+        self.update_root = update_root
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self.service.prepare_update(self.update, self.update_root))
+        except Exception as exc:
+            self.failed.emit(str(exc))

@@ -78,6 +78,17 @@ def test_window_defaults_and_config(tmp_path: Path, qt_app: QApplication) -> Non
     window.close()
 
 
+def test_window_exposes_a_manual_update_check_without_starting_an_install(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = _window(tmp_path)
+
+    assert window.update_check_button.text() == "检查更新"
+    assert window.update_status_label.text() == "当前版本 v0.7.2"
+    assert window._should_auto_check_for_update() is True
+    window.close()
+
+
 def test_window_rejects_reversed_price_range(tmp_path: Path, qt_app: QApplication) -> None:
     window = _window(tmp_path)
     window.keyword_edit.setText("耳机")

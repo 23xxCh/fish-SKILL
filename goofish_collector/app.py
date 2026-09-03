@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -48,17 +49,21 @@ from PySide6.QtWidgets import (
 )
 
 from .browser import default_profile_dir, profile_has_saved_login
+from . import __version__
 from .checkpoint import CheckpointStore
 from .models import CrawlConfig, CrawlProgress, ProductRecord, ScheduledCollectionConfig, SearchFilters
 from .feishu_binding import FeishuBindingWorker
 from .monitor_models import FeishuConfig, NotificationBatch
 from .monitor_store import MonitorStore
 from .notifications import FeishuProvider
+from .updater import PreparedUpdate, UpdateInfo, UpdateService
 from .workers import (
     CrawlWorker,
     LoginWorker,
     NotificationDeliveryWorker,
     NotificationTestWorker,
+    UpdateCheckWorker,
+    UpdatePreparationWorker,
 )
 
 
@@ -245,6 +250,9 @@ class MainWindow(QMainWindow):
         self._notification_test_worker: NotificationTestWorker | None = None
         self._notification_delivery_worker: NotificationDeliveryWorker | None = None
         self._feishu_binding_worker: FeishuBindingWorker | None = None
+        self._update_check_worker: UpdateCheckWorker | None = None
+        self._update_preparation_worker: UpdatePreparationWorker | None = None
+        self._update_check_is_manual = False
         self._scheduled_collection: ScheduledCollectionConfig | None = None
         self._active_run_is_scheduled = False
         self._schedule_timer = QTimer(self)
@@ -255,18 +263,128 @@ class MainWindow(QMainWindow):
         self._default_output_dir = default_output_dir or self._documents_output_dir()
         self._profile_dir = (profile_dir or default_profile_dir()).resolve()
         self._monitor_store = MonitorStore(monitor_db_path)
+        self._update_service = UpdateService(__version__)
         self._build_ui()
         self._refresh_login_state()
         self._set_running_state(False)
         self._load_notification_settings()
         self._load_scheduled_collection()
         self._setup_tray()
+        if self._should_auto_check_for_update():
+            QTimer.singleShot(2_000, self._check_for_update)
 
     @staticmethod
     def _documents_output_dir() -> Path:
         documents = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
         base = Path(documents) if documents else Path.home() / "Documents"
         return base / "闲鱼采集结果"
+
+    def _should_auto_check_for_update(self) -> bool:
+        checked_at = self._monitor_store.load_update_check_at()
+        return checked_at is None or datetime.now() - checked_at >= timedelta(days=1)
+
+    @staticmethod
+    def _update_staging_dir() -> Path:
+        local_data = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
+        root = Path(local_data) if local_data else Path.home() / "AppData" / "Local" / "GoofishLinkCollector"
+        return root / "updates"
+
+    @staticmethod
+    def _packaged_install_dir() -> Path | None:
+        executable = Path(sys.executable).resolve()
+        if getattr(sys, "frozen", False) and executable.name == "XianyuLinkCollector.exe":
+            return executable.parent
+        return None
+
+    def _check_for_update(self, *, manual: bool = False) -> None:
+        if self._crawl_worker is not None and self._crawl_worker.isRunning():
+            if manual:
+                QMessageBox.information(self, "暂不能更新", "采集进行中，请结束当前任务后再更新。")
+            return
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
+            return
+        self._update_check_is_manual = manual
+        self.update_check_button.setEnabled(False)
+        self.update_status_label.setText("正在检查更新…")
+        self._update_check_worker = UpdateCheckWorker(self._update_service)
+        self._update_check_worker.completed.connect(self._update_check_completed)
+        self._update_check_worker.failed.connect(self._update_check_failed)
+        self._update_check_worker.finished.connect(self._update_check_finished)
+        self._update_check_worker.start()
+
+    def _update_check_completed(self, update: UpdateInfo | None) -> None:
+        self._monitor_store.save_update_check_at(datetime.now())
+        if update is None:
+            self.update_status_label.setText(f"当前已是最新 v{__version__}")
+            if self._update_check_is_manual:
+                QMessageBox.information(self, "已是最新版本", f"当前版本 v{__version__} 已是最新版本。")
+            return
+        self.update_status_label.setText(f"发现新版本 v{update.version}")
+        install_dir = self._packaged_install_dir()
+        if install_dir is None:
+            self._append_log(f"发现 v{update.version}，开发环境不执行自动安装。")
+            if self._update_check_is_manual:
+                QMessageBox.information(self, "发现新版本", f"发现 v{update.version}，请从发布页下载：\n{update.release_url}")
+            return
+        notes = update.notes[:900] or "本次发布未填写更新说明。"
+        answer = QMessageBox.question(
+            self,
+            "发现新版本",
+            f"发现 v{update.version}。\n\n{notes}\n\n现在下载、校验并重启更新吗？\n"
+            "旧版本会保留为本机回退备份。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self._prepare_update(update, install_dir)
+
+    def _update_check_failed(self, message: str) -> None:
+        self.update_status_label.setText(f"当前版本 v{__version__}")
+        self._append_log(f"更新检查失败：{message}")
+        if self._update_check_is_manual:
+            QMessageBox.warning(self, "检查更新失败", f"未下载任何文件。\n{message}")
+
+    def _update_check_finished(self) -> None:
+        self._update_check_worker = None
+        if self._update_preparation_worker is None:
+            self.update_check_button.setEnabled(self._crawl_worker is None or not self._crawl_worker.isRunning())
+
+    def _prepare_update(self, update: UpdateInfo, install_dir: Path) -> None:
+        self.update_status_label.setText(f"正在下载 v{update.version}…")
+        self._update_preparation_worker = UpdatePreparationWorker(
+            self._update_service,
+            update,
+            self._update_staging_dir(),
+        )
+        self._update_preparation_worker.completed.connect(
+            lambda prepared: self._update_preparation_completed(prepared, install_dir)
+        )
+        self._update_preparation_worker.failed.connect(self._update_preparation_failed)
+        self._update_preparation_worker.finished.connect(self._update_preparation_finished)
+        self._update_preparation_worker.start()
+
+    def _update_preparation_completed(self, prepared: PreparedUpdate, install_dir: Path) -> None:
+        try:
+            UpdateService.launch_installer(
+                prepared,
+                install_dir=install_dir,
+                parent_pid=os.getpid(),
+            )
+        except OSError as exc:
+            self._update_preparation_failed(str(exc))
+            return
+        self.update_status_label.setText(f"正在安装 v{prepared.info.version}…")
+        self._append_log(f"更新包已校验，正在退出并安装 v{prepared.info.version}。")
+        QTimer.singleShot(100, QApplication.instance().quit)
+
+    def _update_preparation_failed(self, message: str) -> None:
+        self.update_status_label.setText(f"当前版本 v{__version__}")
+        self._append_log(f"更新下载或校验失败：{message}")
+        QMessageBox.warning(self, "更新未安装", f"旧版本未被改动。\n{message}")
+
+    def _update_preparation_finished(self) -> None:
+        self._update_preparation_worker = None
+        self.update_check_button.setEnabled(self._crawl_worker is None or not self._crawl_worker.isRunning())
 
     def _build_ui(self) -> None:
         self.content_scroll = QScrollArea(self)
@@ -303,7 +421,17 @@ class MainWindow(QMainWindow):
         subtitle = QLabel("首次扫码后自动复用本机登录状态；可单次采集或按间隔采集并推送飞书。")
         subtitle.setObjectName("pageSubtitle")
         header_copy.addWidget(title)
-        header_copy.addWidget(subtitle)
+        subtitle_row = QHBoxLayout()
+        subtitle_row.setSpacing(8)
+        subtitle_row.addWidget(subtitle, 1)
+        self.update_status_label = QLabel(f"当前版本 v{__version__}")
+        self.update_status_label.setObjectName("updateStatus")
+        self.update_check_button = QPushButton("检查更新")
+        self.update_check_button.setObjectName("updateCheckButton")
+        self.update_check_button.clicked.connect(lambda: self._check_for_update(manual=True))
+        subtitle_row.addWidget(self.update_status_label)
+        subtitle_row.addWidget(self.update_check_button)
+        header_copy.addLayout(subtitle_row)
         header.addLayout(header_copy, 1)
 
         login_panel = QFrame()
@@ -661,6 +789,8 @@ class MainWindow(QMainWindow):
             QLabel#pageSubtitle, QLabel#sectionHint, QLabel#loginStateHint,
             QLabel#metricLabel { color: #667386; }
             QLabel#pageSubtitle { font-size: 14px; }
+            QLabel#updateStatus { font-size: 12px; color: #667386; }
+            QPushButton#updateCheckButton { min-height: 22px; padding: 4px 10px; font-size: 12px; }
             QLabel#sectionTitle { font-size: 16px; font-weight: 700; color: #172033; }
             QLabel#fieldLabel {
                 min-height: 18px; font-size: 13px; font-weight: 600; color: #465468;
@@ -1251,6 +1381,11 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(running)
         self.open_button.setEnabled(not running and self._last_output is not None)
         self.feishu_settings_button.setEnabled(not running)
+        self.update_check_button.setEnabled(
+            not running
+            and self._update_check_worker is None
+            and self._update_preparation_worker is None
+        )
         self._update_schedule_ui()
 
     def _show_feishu_settings(self) -> None:

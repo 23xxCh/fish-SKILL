@@ -75,6 +75,17 @@ def test_provider_secrets_are_not_stored_as_plaintext(tmp_path: Path) -> None:
     assert store.load_wxpusher_config() == WxPusherConfig(spt="SPT_private-token")
 
 
+def test_update_check_timestamp_is_local_state_and_tolerates_invalid_legacy_value(tmp_path: Path) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    checked_at = datetime(2026, 9, 3, 16, 30, 0)
+
+    store.save_update_check_at(checked_at)
+
+    assert store.load_update_check_at() == checked_at
+    store._set_setting("update_check_at", "not-a-date")
+    assert store.load_update_check_at() is None
+
+
 def test_outbox_preserves_provider_and_retries(tmp_path: Path) -> None:
     store = MonitorStore(tmp_path / "monitor.db")
     task = MonitorTaskConfig(name="任务", keyword="耳机")

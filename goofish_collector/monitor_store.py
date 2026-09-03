@@ -356,6 +356,18 @@ class MonitorStore:
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             return None
 
+    def save_update_check_at(self, checked_at: datetime) -> None:
+        self._set_setting("update_check_at", checked_at.isoformat(timespec="seconds"))
+
+    def load_update_check_at(self) -> datetime | None:
+        value = self._get_setting("update_check_at")
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
     def save_wxpusher_config(self, config: WxPusherConfig) -> None:
         self._set_setting("wxpusher_spt", protect_text(config.spt.strip()))
 
