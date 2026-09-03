@@ -108,17 +108,27 @@ def extract_card_payloads(page: Page) -> list[CardPayload]:
           const seen = new Set();
           const rows = [];
           const imageUrlFrom = (node) => {
-            const image = node && node.querySelector ? node.querySelector("img") : null;
-            if (!image) return "";
-            const candidates = [
-              image.currentSrc,
-              image.getAttribute("src"),
-              image.getAttribute("data-src"),
-              image.getAttribute("data-original"),
-              image.getAttribute("data-lazy-src"),
-              image.getAttribute("data-ks-lazyload"),
-              image.getAttribute("srcset"),
-            ];
+            if (!node || !node.querySelectorAll) return "";
+            const candidates = [];
+            for (const video of node.querySelectorAll("video")) {
+              candidates.push(
+                video.getAttribute("poster"),
+                video.getAttribute("data-poster"),
+                video.getAttribute("data-cover"),
+                video.getAttribute("data-video-cover")
+              );
+            }
+            for (const image of node.querySelectorAll("img")) {
+              candidates.push(
+                image.currentSrc,
+                image.getAttribute("src"),
+                image.getAttribute("data-src"),
+                image.getAttribute("data-original"),
+                image.getAttribute("data-lazy-src"),
+                image.getAttribute("data-ks-lazyload"),
+                image.getAttribute("srcset")
+              );
+            }
             for (let candidate of candidates) {
               if (!candidate) continue;
               candidate = candidate.trim();

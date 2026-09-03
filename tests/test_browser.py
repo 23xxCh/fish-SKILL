@@ -35,6 +35,29 @@ def test_extract_card_payloads_from_local_html() -> None:
     assert payloads[3].image_url == ""
 
 
+@pytest.mark.browser
+def test_extract_card_payloads_prefers_a_video_poster_to_blank_image_placeholder() -> None:
+    html = """
+    <html><body>
+      <article>
+        <video poster="https://img.goofish.example/video-cover.jpg"></video>
+        <img src="https://img.goofish.example/blank-placeholder.jpg">
+        <a href="https://www.goofish.com/item?id=2001">视频商品</a>
+        <span>¥288</span>
+      </article>
+    </body></html>
+    """
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        page = browser.new_page()
+        page.set_content(html)
+        payloads = extract_card_payloads(page)
+        browser.close()
+
+    assert len(payloads) == 1
+    assert payloads[0].image_url == "https://img.goofish.example/video-cover.jpg"
+
+
 @pytest.mark.parametrize(
     ("url", "text", "expected"),
     [

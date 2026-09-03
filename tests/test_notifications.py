@@ -1,6 +1,8 @@
 import json
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from goofish_collector.models import ProductRecord
 from goofish_collector.monitor_models import FeishuConfig, NotificationBatch, WxPusherConfig
@@ -54,6 +56,13 @@ def _batch(provider_id: str, *, image_urls: list[str] | None = None) -> Notifica
     return NotificationBatch(
         task_id="t1", task_name="耳机监控", provider_id=provider_id, items=items, total_count=13
     )
+
+
+def _image_bytes(color: str) -> tuple[bytes, str]:
+    image = Image.new("RGB", (80, 60), color=color)
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue(), "image/png"
 
 
 def test_wxpusher_builds_html_with_real_links() -> None:
@@ -113,7 +122,7 @@ def test_feishu_uploads_product_image_before_card_text_and_buttons() -> None:
     provider = FeishuProvider(
         FeishuConfig(app_id="cli_1", app_secret="secret", open_id="ou_1"),
         transport=transport,
-        image_fetcher=lambda _: (b"image-bytes", "image/jpeg"),
+        image_fetcher=lambda _: _image_bytes("red"),
     )
     source = _batch("feishu", image_urls=["https://img.goofish.example/item-1.jpg"])
     batch = NotificationBatch(
@@ -133,7 +142,7 @@ def test_feishu_uploads_product_image_before_card_text_and_buttons() -> None:
     upload = transport.multipart_calls[0]
     assert upload[1] == {"image_type": "message"}
     assert upload[2] == "image"
-    assert upload[4] == b"image-bytes"
+    assert upload[4] == _image_bytes("red")[0]
     send_payload = transport.calls[-1][1]
     card = json.loads(send_payload["content"])
     assert card["elements"][0]["tag"] == "img"
@@ -173,4 +182,36 @@ def test_feishu_falls_back_to_text_card_when_product_image_is_unavailable() -> N
     card = json.loads(transport.calls[-1][1]["content"])
     assert card["elements"][0]["tag"] == "div"
     assert card["elements"][1]["tag"] == "action"
+    assert card["elements"][1]["actions"][-1]["url"] == "https://www.goofish.com/item?id=1"
+
+
+def test_feishu_skips_a_blank_video_placeholder_image() -> None:
+    transport = FakeTransport(
+        [
+            HttpResponse(200, '{"code":0,"tenant_access_token":"token-1","expire":7200}'),
+            HttpResponse(200, '{"code":0,"msg":"success"}'),
+        ]
+    )
+    provider = FeishuProvider(
+        FeishuConfig(app_id="cli_1", app_secret="secret", open_id="ou_1"),
+        transport=transport,
+        image_fetcher=lambda _: _image_bytes("white"),
+    )
+    source = _batch("feishu", image_urls=["https://img.goofish.example/video-placeholder.jpg"])
+    batch = NotificationBatch(
+        task_id=source.task_id,
+        task_name=source.task_name,
+        provider_id=source.provider_id,
+        items=source.items[:1],
+        total_count=1,
+        item_label="商品",
+    )
+
+    result = provider.send_batch(batch)
+
+    assert result.success
+    assert "图片已展示 0/1" in result.message
+    assert transport.multipart_calls == []
+    card = json.loads(transport.calls[-1][1]["content"])
+    assert card["elements"][0]["tag"] == "div"
     assert card["elements"][1]["actions"][-1]["url"] == "https://www.goofish.com/item?id=1"

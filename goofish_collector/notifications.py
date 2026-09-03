@@ -7,9 +7,12 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Callable, Protocol
 from urllib.parse import urlparse
 from uuid import uuid4
+
+from PIL import Image, UnidentifiedImageError
 
 from .models import ProductRecord
 from .monitor_models import (
@@ -27,6 +30,8 @@ FEISHU_MESSAGE_URL = (
 FEISHU_IMAGE_URL = "https://open.feishu.cn/open-apis/im/v1/images"
 WXPUSHER_SIMPLE_URL = "https://wxpusher.zjiecode.com/api/send/message/simple-push"
 MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024
+MIN_FEISHU_IMAGE_SIDE = 32
+MAX_FEISHU_IMAGE_PIXELS = 16_000_000
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,28 @@ class HttpResponse:
 
     def json(self) -> dict:
         return json.loads(self.text or "{}")
+
+
+def _is_displayable_image(content: bytes) -> bool:
+    """Reject transparent, tiny, and all-white placeholder images before Feishu upload."""
+    try:
+        with Image.open(BytesIO(content)) as image:
+            if (
+                image.width < MIN_FEISHU_IMAGE_SIDE
+                or image.height < MIN_FEISHU_IMAGE_SIDE
+                or image.width * image.height > MAX_FEISHU_IMAGE_PIXELS
+            ):
+                return False
+            image.thumbnail((64, 64))
+            if "A" in image.getbands():
+                background = Image.new("RGB", image.size, "white")
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            return any(low < 250 for low, _ in image.getextrema())
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
+        return False
 
 
 class JsonTransport(Protocol):
@@ -288,7 +315,11 @@ class FeishuProvider:
                 content = response.read(MAX_FEISHU_IMAGE_BYTES + 1)
         except (OSError, ValueError, urllib.error.URLError):
             return None
-        if not content or len(content) > MAX_FEISHU_IMAGE_BYTES:
+        if (
+            not content
+            or len(content) > MAX_FEISHU_IMAGE_BYTES
+            or not _is_displayable_image(content)
+        ):
             return None
         return content, content_type
 
@@ -318,7 +349,7 @@ class FeishuProvider:
                 continue
             try:
                 image = self.image_fetcher(item.image_url)
-                if image is None:
+                if image is None or not _is_displayable_image(image[0]):
                     continue
                 image_key = self._upload_image(token, *image)
             except Exception:

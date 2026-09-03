@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goofish-link-collector"
-version = "0.8.0"
+version = "0.8.1"
 description = "Windows desktop collector with timed collection and Feishu pushes for Goofish"
 requires-python = ">=3.13"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
   "playwright>=1.60,<2",
   "PySide6>=6.11,<7",
   "lark-oapi>=1.7.1,<2",
+  "Pillow>=12.0,<13",
 ]
 
 [project.scripts]
