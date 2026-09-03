@@ -1,7 +1,11 @@
 from datetime import datetime
 from pathlib import Path
 
-from goofish_collector.models import ProductRecord, SearchFilters
+from goofish_collector.models import (
+    ProductRecord,
+    ScheduledCollectionHealth,
+    SearchFilters,
+)
 from goofish_collector.monitor_models import (
     FeishuConfig,
     MonitorTaskConfig,
@@ -84,6 +88,84 @@ def test_update_check_timestamp_is_local_state_and_tolerates_invalid_legacy_valu
     assert store.load_update_check_at() == checked_at
     store._set_setting("update_check_at", "not-a-date")
     assert store.load_update_check_at() is None
+
+
+def test_scheduled_delivery_changes_use_a_full_first_batch_then_only_new_or_repriced_items(
+    tmp_path: Path,
+) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    first = [_record("1"), _record("2")]
+    first[1].price = 20
+
+    assert [record.item_id for record in store.select_scheduled_delivery_records(first, changes_only=True)] == [
+        "1",
+        "2",
+    ]
+
+    later = [_record("1"), _record("2"), _record("3")]
+    later[0].price = 99
+    later[1].price = 20
+    assert [record.item_id for record in store.select_scheduled_delivery_records(later, changes_only=True)] == [
+        "1",
+        "3",
+    ]
+    assert store.select_scheduled_delivery_records(later, changes_only=True) == []
+
+
+def test_scheduled_delivery_full_mode_still_refreshes_the_change_baseline(tmp_path: Path) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    first = [_record("1")]
+    first[0].price = 10
+
+    assert store.select_scheduled_delivery_records(first, changes_only=False) == first
+    assert store.select_scheduled_delivery_records(first, changes_only=True) == []
+
+
+def test_clearing_scheduled_delivery_snapshot_makes_the_next_change_only_run_a_baseline(
+    tmp_path: Path,
+) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    records = [_record("1")]
+
+    store.select_scheduled_delivery_records(records, changes_only=False)
+    store.clear_scheduled_delivery_snapshot()
+
+    assert store.select_scheduled_delivery_records(records, changes_only=True) == records
+
+
+def test_scheduled_health_persists_without_notification_credentials(tmp_path: Path) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    health = ScheduledCollectionHealth(
+        last_started_at="2026-09-03 17:00:00",
+        last_succeeded_at="2026-09-03 17:01:00",
+        last_item_count=12,
+        last_output="C:/exports/result.xlsx",
+        delivery_status="待重试（1）",
+        pending_deliveries=1,
+    )
+
+    store.save_scheduled_health(health)
+
+    assert store.load_scheduled_health() == health
+
+
+def test_scheduled_delivery_outbox_can_be_marked_sent_without_an_old_monitor_task(
+    tmp_path: Path,
+) -> None:
+    store = MonitorStore(tmp_path / "monitor.db")
+    batch = store.enqueue_batch(
+        NotificationBatch(
+            task_id="scheduled_collection",
+            task_name="定时采集：耳机",
+            provider_id="feishu",
+            items=[_record("1")],
+            total_count=1,
+        )
+    )
+
+    store.mark_batch_sent(batch.batch_id)
+
+    assert store.get_batch(batch.batch_id).status == "sent"
 
 
 def test_outbox_preserves_provider_and_retries(tmp_path: Path) -> None:

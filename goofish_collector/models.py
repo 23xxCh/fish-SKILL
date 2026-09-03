@@ -148,6 +148,7 @@ class ScheduledCollectionConfig:
     crawl_config: CrawlConfig
     interval_minutes: int = 30
     enabled: bool = False
+    notify_changes_only: bool = False
 
     def __post_init__(self) -> None:
         if self.interval_minutes not in SCHEDULE_INTERVALS:
@@ -158,6 +159,7 @@ class ScheduledCollectionConfig:
             "crawl_config": self.crawl_config.to_dict(),
             "interval_minutes": self.interval_minutes,
             "enabled": self.enabled,
+            "notify_changes_only": self.notify_changes_only,
         }
 
     @classmethod
@@ -168,6 +170,34 @@ class ScheduledCollectionConfig:
             crawl_config=CrawlConfig.from_dict(data["crawl_config"]),
             interval_minutes=int(data.get("interval_minutes", 30)),
             enabled=bool(data.get("enabled", False)),
+            notify_changes_only=bool(data.get("notify_changes_only", False)),
+        )
+
+
+@dataclass(frozen=True)
+class ScheduledCollectionHealth:
+    last_started_at: str = ""
+    last_succeeded_at: str = ""
+    last_item_count: int = 0
+    last_output: str = ""
+    last_error: str = ""
+    delivery_status: str = "未推送"
+    pending_deliveries: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ScheduledCollectionHealth:
+        data = data or {}
+        return cls(
+            last_started_at=str(data.get("last_started_at", "")),
+            last_succeeded_at=str(data.get("last_succeeded_at", "")),
+            last_item_count=max(0, int(data.get("last_item_count", 0))),
+            last_output=str(data.get("last_output", "")),
+            last_error=str(data.get("last_error", "")),
+            delivery_status=str(data.get("delivery_status", "未推送")),
+            pending_deliveries=max(0, int(data.get("pending_deliveries", 0))),
         )
 
 

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .models import ProductRecord, ScheduledCollectionConfig
+from .models import ProductRecord, ScheduledCollectionConfig, ScheduledCollectionHealth
 from .monitor_models import (
     FeishuConfig,
     MonitorTaskConfig,
@@ -95,6 +95,11 @@ class MonitorStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_due
                     ON outbox(status, available_at);
+                CREATE TABLE IF NOT EXISTS scheduled_delivery_snapshot (
+                    item_key TEXT PRIMARY KEY,
+                    price REAL,
+                    seen_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -356,6 +361,52 @@ class MonitorStore:
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             return None
 
+    def save_scheduled_health(self, health: ScheduledCollectionHealth) -> None:
+        self._set_setting(
+            "scheduled_collection_health",
+            json.dumps(health.to_dict(), ensure_ascii=False, sort_keys=True),
+        )
+
+    def load_scheduled_health(self) -> ScheduledCollectionHealth:
+        raw = self._get_setting("scheduled_collection_health")
+        if not raw:
+            return ScheduledCollectionHealth()
+        try:
+            return ScheduledCollectionHealth.from_dict(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ScheduledCollectionHealth()
+
+    def select_scheduled_delivery_records(
+        self, records: list[ProductRecord], *, changes_only: bool
+    ) -> list[ProductRecord]:
+        unique = {record.key: record for record in records}
+        with self._connect() as connection:
+            previous = {
+                row["item_key"]: row["price"]
+                for row in connection.execute(
+                    "SELECT item_key,price FROM scheduled_delivery_snapshot"
+                ).fetchall()
+            }
+            first_delivery = not previous
+            selected = list(unique.values())
+            if changes_only and not first_delivery:
+                selected = [
+                    record
+                    for record in unique.values()
+                    if record.key not in previous or previous[record.key] != record.price
+                ]
+            connection.execute("DELETE FROM scheduled_delivery_snapshot")
+            stamp = datetime.now().isoformat(timespec="seconds")
+            connection.executemany(
+                "INSERT INTO scheduled_delivery_snapshot(item_key,price,seen_at) VALUES(?,?,?)",
+                [(record.key, record.price, stamp) for record in unique.values()],
+            )
+        return selected
+
+    def clear_scheduled_delivery_snapshot(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM scheduled_delivery_snapshot")
+
     def save_update_check_at(self, checked_at: datetime) -> None:
         self._set_setting("update_check_at", checked_at.isoformat(timespec="seconds"))
 
@@ -479,11 +530,16 @@ class MonitorStore:
     def mark_batch_sent(self, batch_id: str, *, sent_at: datetime | None = None) -> None:
         batch = self.get_batch(batch_id)
         stamp = (sent_at or datetime.now()).isoformat(timespec="seconds").replace("T", " ")
-        state = self.get_task_state(batch.task_id)
+        try:
+            state = self.get_task_state(batch.task_id)
+        except KeyError:
+            state = None
         with self._connect() as connection:
             connection.execute(
                 "UPDATE outbox SET status='sent',last_error='' WHERE batch_id=?", (batch_id,)
             )
+            if state is None:
+                return
             for item in batch.items:
                 row = connection.execute(
                     "SELECT record_json FROM products WHERE task_id=? AND generation=? AND item_key=?",

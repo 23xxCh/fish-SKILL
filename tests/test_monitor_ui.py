@@ -5,8 +5,8 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from goofish_collector.app import MainWindow
-from goofish_collector.models import ScheduledCollectionConfig
-from goofish_collector.monitor_models import FeishuConfig
+from goofish_collector.models import CrawlConfig, ProductRecord, ScheduledCollectionConfig
+from goofish_collector.monitor_models import FeishuConfig, NotificationBatch
 
 
 @pytest.fixture(scope="module")
@@ -46,6 +46,97 @@ def test_single_collection_page_saves_timed_collection_snapshot(
     assert saved.crawl_config.filters.region == "广东"
     assert saved.crawl_config.filters.personal_only
     assert window._monitor_store.load_scheduled_collection() == saved
+    window.close()
+
+
+def test_timed_collection_can_opt_into_change_only_delivery(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(
+        default_output_dir=tmp_path,
+        monitor_db_path=tmp_path / "monitor.db",
+        profile_dir=tmp_path / "profile",
+    )
+
+    assert not window.notify_changes_only_checkbox.isChecked()
+    window.notify_changes_only_checkbox.setChecked(True)
+    window.keyword_edit.setText("相机")
+    saved = window._save_scheduled_collection(enabled=True)
+
+    assert saved.notify_changes_only is True
+    assert window._monitor_store.load_scheduled_collection().notify_changes_only is True
+    window.close()
+
+
+def test_timed_collection_health_shows_a_persisted_delivery_retry(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(
+        default_output_dir=tmp_path,
+        monitor_db_path=tmp_path / "monitor.db",
+        profile_dir=tmp_path / "profile",
+    )
+    window.keyword_edit.setText("相机")
+    window._save_scheduled_collection(enabled=True)
+    batch = window._monitor_store.enqueue_batch(
+        NotificationBatch(
+            task_id="scheduled_collection",
+            task_name="定时采集：相机",
+            provider_id="feishu",
+            items=[
+                ProductRecord(
+                    keyword="相机",
+                    item_id="1",
+                    title="相机",
+                    url="https://www.goofish.com/item?id=1",
+                )
+            ],
+            total_count=1,
+        )
+    )
+
+    window._scheduled_delivery_finished(batch.batch_id, False, "网络暂时不可用")
+    qt_app.processEvents()
+
+    retry = window._monitor_store.get_batch(batch.batch_id)
+    assert retry.status == "pending"
+    assert retry.attempts == 1
+    assert window.schedule_health_button.text() == "健康：需处理"
+    window._show_scheduled_health()
+    assert "发送失败" in window.health_delivery_label.text()
+    window.close()
+
+
+def test_timed_collection_queues_the_next_feishu_batch_while_the_previous_one_is_sending(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(
+        default_output_dir=tmp_path,
+        monitor_db_path=tmp_path / "monitor.db",
+        profile_dir=tmp_path / "profile",
+    )
+    window._scheduled_collection = ScheduledCollectionConfig(
+        crawl_config=CrawlConfig(keyword="相机", output_dir=tmp_path), enabled=True
+    )
+    first = ProductRecord(
+        keyword="相机", item_id="1", title="商品一", url="https://www.goofish.com/item?id=1"
+    )
+    second = ProductRecord(
+        keyword="相机", item_id="2", title="商品二", url="https://www.goofish.com/item?id=2"
+    )
+
+    with patch("goofish_collector.app.NotificationDeliveryWorker") as worker_type:
+        worker_type.return_value.isRunning.return_value = True
+        window._push_scheduled_results([first])
+        window._push_scheduled_results([second])
+
+    queued = [
+        batch
+        for batch in window._monitor_store.list_batches(status="pending")
+        if batch.task_id == "scheduled_collection"
+    ]
+    assert len(queued) == 2
+    assert worker_type.call_count == 1
     window.close()
 
 

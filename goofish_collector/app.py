@@ -51,7 +51,14 @@ from PySide6.QtWidgets import (
 from .browser import default_profile_dir, profile_has_saved_login
 from . import __version__
 from .checkpoint import CheckpointStore
-from .models import CrawlConfig, CrawlProgress, ProductRecord, ScheduledCollectionConfig, SearchFilters
+from .models import (
+    CrawlConfig,
+    CrawlProgress,
+    ProductRecord,
+    ScheduledCollectionConfig,
+    ScheduledCollectionHealth,
+    SearchFilters,
+)
 from .feishu_binding import FeishuBindingWorker
 from .monitor_models import FeishuConfig, NotificationBatch
 from .monitor_store import MonitorStore
@@ -258,6 +265,9 @@ class MainWindow(QMainWindow):
         self._schedule_timer = QTimer(self)
         self._schedule_timer.setSingleShot(True)
         self._schedule_timer.timeout.connect(self._run_scheduled_collection)
+        self._delivery_retry_timer = QTimer(self)
+        self._delivery_retry_timer.setSingleShot(True)
+        self._delivery_retry_timer.timeout.connect(self._deliver_scheduled_queue)
         self._next_scheduled_at: datetime | None = None
         self._force_exit = False
         self._default_output_dir = default_output_dir or self._documents_output_dir()
@@ -269,6 +279,8 @@ class MainWindow(QMainWindow):
         self._set_running_state(False)
         self._load_notification_settings()
         self._load_scheduled_collection()
+        self._refresh_scheduled_health_ui()
+        QTimer.singleShot(0, self._deliver_scheduled_queue)
         self._setup_tray()
         if self._should_auto_check_for_update():
             QTimer.singleShot(2_000, self._check_for_update)
@@ -677,7 +689,17 @@ class MainWindow(QMainWindow):
         schedule_title = QLabel("定时采集")
         schedule_title.setObjectName("sectionTitle")
         schedule_title.setToolTip("按当前采集条件循环执行；每次完成后推送飞书。")
-        schedule_layout.addWidget(schedule_title)
+        schedule_title_row = QHBoxLayout()
+        schedule_title_row.setContentsMargins(0, 0, 0, 0)
+        schedule_title_row.setSpacing(6)
+        schedule_title_row.addWidget(schedule_title)
+        schedule_title_row.addStretch(1)
+        self.schedule_health_button = QPushButton("任务健康")
+        self.schedule_health_button.setObjectName("scheduleHealthButton")
+        self.schedule_health_button.setFixedHeight(20)
+        self.schedule_health_button.clicked.connect(self._show_scheduled_health)
+        schedule_title_row.addWidget(self.schedule_health_button)
+        schedule_layout.addLayout(schedule_title_row)
         schedule_controls = QHBoxLayout()
         self.schedule_interval_combo = QComboBox()
         for minutes in (5, 10, 15, 30, 60):
@@ -705,6 +727,37 @@ class MainWindow(QMainWindow):
         schedule_buttons.addWidget(self.schedule_stop_button)
         schedule_layout.addLayout(schedule_buttons)
         sidebar_layout.addWidget(schedule_panel)
+
+        self.schedule_health_dialog = QDialog()
+        self.schedule_health_dialog.setWindowTitle("任务健康")
+        self.schedule_health_dialog.setWindowIcon(application_icon())
+        self.schedule_health_dialog.setModal(False)
+        health_layout = QVBoxLayout(self.schedule_health_dialog)
+        health_layout.setContentsMargins(18, 12, 18, 12)
+        health_layout.setSpacing(4)
+        health_title = QLabel("任务健康")
+        health_title.setObjectName("sectionTitle")
+        self.notify_changes_only_checkbox = QCheckBox("只推送新增/价格变化")
+        self.notify_changes_only_checkbox.setToolTip(
+            "首次启用仍完整推送一轮；之后没有新增或价格变化时，只导出 Excel，不发送飞书。"
+        )
+        self.health_last_success_label = QLabel("最近成功：尚无记录")
+        self.health_result_label = QLabel("最近结果：—")
+        self.health_delivery_label = QLabel("飞书投递：未推送")
+        for label in (
+            self.health_last_success_label,
+            self.health_result_label,
+            self.health_delivery_label,
+        ):
+            label.setObjectName("sectionHint")
+            label.setWordWrap(True)
+        health_layout.addWidget(health_title)
+        health_layout.addWidget(self.notify_changes_only_checkbox)
+        health_layout.addWidget(self.health_last_success_label)
+        health_layout.addWidget(self.health_result_label)
+        health_layout.addWidget(self.health_delivery_label)
+        self.schedule_health_dialog.hide()
+
 
         self.result_panel = QFrame()
         self.result_panel.setObjectName("resultPanel")
@@ -850,6 +903,9 @@ class MainWindow(QMainWindow):
             QPushButton#primaryButton:disabled { background: #f1e6b3; color: #9a8b52; }
             QPushButton#loginButton { min-height: 42px; }
             QPushButton#compactButton { min-height: 42px; }
+            QPushButton#scheduleHealthButton {
+                min-height: 0; max-height: 20px; padding: 1px 7px; font-size: 12px;
+            }
             """
         )
         self._build_feishu_dialog()
@@ -1001,6 +1057,7 @@ class MainWindow(QMainWindow):
         self._scheduled_collection = saved
         self._apply_scheduled_config_to_form(saved.crawl_config)
         self.schedule_interval_combo.setCurrentText(f"{saved.interval_minutes} 分钟")
+        self.notify_changes_only_checkbox.setChecked(saved.notify_changes_only)
         self._update_schedule_ui()
         if saved.enabled:
             self._schedule_next_run(log_message=False)
@@ -1020,11 +1077,15 @@ class MainWindow(QMainWindow):
         self.brand_new_checkbox.setChecked(config.filters.brand_new)
 
     def _save_scheduled_collection(self, *, enabled: bool) -> ScheduledCollectionConfig:
+        previous = self._scheduled_collection
         config = ScheduledCollectionConfig(
             crawl_config=self.build_config(),
             interval_minutes=int(self.schedule_interval_combo.currentData()),
             enabled=enabled,
+            notify_changes_only=self.notify_changes_only_checkbox.isChecked(),
         )
+        if previous is not None and previous.crawl_config != config.crawl_config:
+            self._monitor_store.clear_scheduled_delivery_snapshot()
         self._monitor_store.save_scheduled_collection(config)
         self._scheduled_collection = config
         self._update_schedule_ui()
@@ -1054,11 +1115,13 @@ class MainWindow(QMainWindow):
 
     def _stop_scheduled_collection(self, *, show_message: bool = True) -> None:
         self._schedule_timer.stop()
+        self._delivery_retry_timer.stop()
         if self._scheduled_collection is not None:
             disabled = ScheduledCollectionConfig(
                 crawl_config=self._scheduled_collection.crawl_config,
                 interval_minutes=self._scheduled_collection.interval_minutes,
                 enabled=False,
+                notify_changes_only=self._scheduled_collection.notify_changes_only,
             )
             self._monitor_store.save_scheduled_collection(disabled)
             self._scheduled_collection = disabled
@@ -1098,12 +1161,17 @@ class MainWindow(QMainWindow):
         self._next_scheduled_at = None
         self._update_schedule_ui()
         self._append_log(f"定时采集开始：关键词“{scheduled.crawl_config.keyword}”。")
+        self._save_scheduled_health(
+            last_started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            last_error="",
+        )
         self._start_crawl(config=scheduled.crawl_config, scheduled=True)
 
     def _update_schedule_ui(self) -> None:
         scheduled = self._scheduled_collection
         enabled = bool(scheduled and scheduled.enabled)
         self.schedule_interval_combo.setEnabled(not self._is_crawling() and not enabled)
+        self.notify_changes_only_checkbox.setEnabled(not self._is_crawling() and not enabled)
         self.schedule_start_button.setEnabled(not self._is_crawling() and not enabled)
         self.schedule_stop_button.setEnabled(enabled)
         if not enabled:
@@ -1116,6 +1184,50 @@ class MainWindow(QMainWindow):
             )
         else:
             self.schedule_status_label.setText("定时采集：已启动，等待执行")
+        self._refresh_scheduled_health_ui()
+
+    def _scheduled_pending_batches(self) -> list[NotificationBatch]:
+        return [
+            batch
+            for batch in self._monitor_store.list_batches(status="pending")
+            if batch.task_id == "scheduled_collection"
+        ]
+
+    def _save_scheduled_health(self, **changes: object) -> ScheduledCollectionHealth:
+        health = replace(self._monitor_store.load_scheduled_health(), **changes)
+        self._monitor_store.save_scheduled_health(health)
+        self._refresh_scheduled_health_ui()
+        return health
+
+    def _refresh_scheduled_health_ui(self) -> None:
+        health = self._monitor_store.load_scheduled_health()
+        pending_count = len(self._scheduled_pending_batches())
+        if health.pending_deliveries != pending_count:
+            health = replace(health, pending_deliveries=pending_count)
+            self._monitor_store.save_scheduled_health(health)
+        self.health_last_success_label.setText(
+            f"最近成功：{health.last_succeeded_at or '尚无记录'}"
+        )
+        output_name = Path(health.last_output).name if health.last_output else "—"
+        self.health_result_label.setText(
+            f"最近结果：{health.last_item_count:,} 条 · {output_name}"
+        )
+        pending_suffix = f"；待投递 {pending_count} 条" if pending_count else ""
+        self.health_delivery_label.setText(
+            f"飞书投递：{health.delivery_status}{pending_suffix}"
+        )
+        self.health_delivery_label.setToolTip(health.last_error)
+        needs_attention = bool(health.last_error or pending_count)
+        self.schedule_health_button.setText("健康：需处理" if needs_attention else "任务健康")
+        self.schedule_health_button.setToolTip(
+            "查看最近成功、导出结果、飞书投递和待重试状态"
+        )
+
+    def _show_scheduled_health(self) -> None:
+        self._refresh_scheduled_health_ui()
+        self.schedule_health_dialog.show()
+        self.schedule_health_dialog.raise_()
+        self.schedule_health_dialog.activateWindow()
 
     def _start_login(self) -> None:
         if self._login_worker is not None and self._login_worker.isRunning():
@@ -1291,6 +1403,12 @@ class MainWindow(QMainWindow):
         self._append_log(f"Excel：{output}")
         self.open_button.setEnabled(True)
         if self._active_run_is_scheduled:
+            self._save_scheduled_health(
+                last_succeeded_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                last_item_count=count,
+                last_output=output,
+                last_error="",
+            )
             if not reason.startswith(("用户停止", "运行错误")):
                 self._push_scheduled_results(records)
             return
@@ -1303,42 +1421,113 @@ class MainWindow(QMainWindow):
         scheduled = self._scheduled_collection
         if scheduled is None or not scheduled.enabled:
             return
-        if (
-            self._notification_delivery_worker is not None
-            and self._notification_delivery_worker.isRunning()
-        ):
-            self._append_log("上一条飞书推送仍在发送，本次结果未重复推送。")
+        delivery_records = self._monitor_store.select_scheduled_delivery_records(
+            records,
+            changes_only=scheduled.notify_changes_only,
+        )
+        if not delivery_records:
+            self._save_scheduled_health(delivery_status="本轮无变化，未推送")
+            self._append_log("本轮没有新增商品或价格变化，已导出 Excel，未发送飞书。")
             return
         batch = NotificationBatch(
             task_id="scheduled_collection",
             task_name=f"定时采集：{scheduled.crawl_config.keyword}",
             provider_id="feishu",
-            items=records,
-            total_count=len(records),
+            items=delivery_records,
+            total_count=len(delivery_records),
             item_label="商品",
         )
+        self._monitor_store.enqueue_batch(batch)
+        self._save_scheduled_health(
+            delivery_status=f"待投递（{len(delivery_records)} 条）"
+        )
+        self._append_log(
+            f"飞书结果已进入本机投递队列：{len(delivery_records)} 条商品。"
+        )
+        self._deliver_scheduled_queue()
+
+    def _deliver_scheduled_queue(self) -> None:
+        scheduled = self._scheduled_collection
+        if scheduled is None or not scheduled.enabled:
+            self._delivery_retry_timer.stop()
+            self._refresh_scheduled_health_ui()
+            return
+        if (
+            self._notification_delivery_worker is not None
+            and self._notification_delivery_worker.isRunning()
+        ):
+            return
+        now = datetime.now()
+        pending = self._scheduled_pending_batches()
+        due = [
+            batch
+            for batch in pending
+            if datetime.fromisoformat(batch.available_at) <= now
+        ]
+        if not due:
+            self._schedule_delivery_retry(pending)
+            return
+        batch = due[0]
         worker = NotificationDeliveryWorker(
             FeishuProvider(self._monitor_store.load_feishu_config()), batch
         )
         self._notification_delivery_worker = worker
-        worker.completed.connect(self._scheduled_delivery_finished)
+        worker.completed.connect(
+            lambda success, message, batch_id=batch.batch_id: self._scheduled_delivery_finished(
+                batch_id, success, message
+            )
+        )
         worker.finished.connect(self._scheduled_delivery_thread_finished)
+        self._save_scheduled_health(delivery_status="飞书正在发送")
         worker.start()
 
-    def _scheduled_delivery_finished(self, success: bool, message: str) -> None:
+    def _schedule_delivery_retry(self, pending: list[NotificationBatch] | None = None) -> None:
+        pending = pending if pending is not None else self._scheduled_pending_batches()
+        if not pending:
+            self._delivery_retry_timer.stop()
+            self._refresh_scheduled_health_ui()
+            return
+        next_at = min(datetime.fromisoformat(batch.available_at) for batch in pending)
+        delay_ms = max(50, int((next_at - datetime.now()).total_seconds() * 1000))
+        self._delivery_retry_timer.start(delay_ms)
+        self._refresh_scheduled_health_ui()
+
+    def _scheduled_delivery_finished(self, batch_id: str, success: bool, message: str) -> None:
         if success:
+            self._monitor_store.mark_batch_sent(batch_id)
+            self._save_scheduled_health(
+                delivery_status=f"已送达 {datetime.now().strftime('%H:%M')}",
+                last_error="",
+            )
             self._append_log(f"本次定时采集结果已推送至飞书：{message}")
         else:
-            self._append_log(f"飞书推送失败：{message}")
+            retry = self._monitor_store.record_delivery_failure(batch_id, message)
+            if retry.status == "pending":
+                self._save_scheduled_health(
+                    delivery_status=f"发送失败，将第 {retry.attempts} 次重试",
+                    last_error=message,
+                )
+                self._append_log(
+                    f"飞书推送失败，将在 {retry.available_at[11:16]} 自动重试：{message}"
+                )
+            else:
+                self._save_scheduled_health(
+                    delivery_status="投递失败，请检查飞书设置",
+                    last_error=message,
+                )
+                self._append_log(f"飞书推送已重试 {retry.attempts} 次，仍失败：{message}")
 
     def _scheduled_delivery_thread_finished(self) -> None:
         if self._notification_delivery_worker is not None:
             self._notification_delivery_worker.deleteLater()
             self._notification_delivery_worker = None
+        self._deliver_scheduled_queue()
 
     def _crawl_failed(self, message: str) -> None:
         self.status_value.setText("任务失败")
         self._append_log(f"任务失败：{message}")
+        if self._active_run_is_scheduled:
+            self._save_scheduled_health(last_error=message, delivery_status="本轮采集失败")
         if not self._active_run_is_scheduled:
             QMessageBox.critical(self, "任务失败", message)
 
@@ -1587,6 +1776,7 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.schedule_health_dialog.hide()
         scheduled_enabled = bool(
             self._scheduled_collection and self._scheduled_collection.enabled
         )
