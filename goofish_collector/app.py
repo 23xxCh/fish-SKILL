@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QStandardPaths, Qt, QTime, QUrl
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QStandardPaths, Qt, QTime, QUrl
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QStyleFactory,
     QSystemTrayIcon,
     QTabWidget,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -40,7 +42,7 @@ from PySide6.QtWidgets import (
 
 from .browser import default_profile_dir, profile_has_saved_login
 from .checkpoint import CheckpointStore
-from .models import CrawlConfig, CrawlProgress, SearchFilters
+from .models import CrawlConfig, CrawlProgress, ProductRecord, SearchFilters
 from .exporter import export_monitor_workbook
 from .feishu_binding import FeishuBindingWorker
 from .monitor_models import FeishuConfig, MonitorTaskConfig, WxPusherConfig
@@ -99,6 +101,73 @@ class OptionalPriceSpinBox(QDoubleSpinBox):
         super().focusOutEvent(event)
         if self.value() == self.minimum():
             self.setSpecialValueText("不限")
+
+
+class CrawlResultsModel(QAbstractTableModel):
+    _headers = ("商品", "价格")
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._records: list[ProductRecord] = []
+        self._rows_by_key: dict[str, int] = {}
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._records)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._headers)
+
+    def headerData(self, section: int, orientation, role: int = Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self._headers[section]
+        return None
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        record = self._records[index.row()]
+        if role == Qt.UserRole:
+            return record.url
+        if role == Qt.TextAlignmentRole and index.column() == 1:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        if role == Qt.ToolTipRole:
+            details = "｜".join(
+                part for part in (record.region, record.condition, record.publish_or_change) if part
+            )
+            return "\n".join(part for part in (record.title, details, record.url) if part)
+        if role != Qt.DisplayRole:
+            return None
+        if index.column() == 0:
+            details = "｜".join(
+                part for part in (record.region, record.condition) if part
+            )
+            if record.appearances > 1:
+                details = "｜".join(part for part in (details, f"出现 {record.appearances} 次") if part)
+            return "\n".join(part for part in (record.title or "未命名商品", details) if part)
+        if index.column() == 1:
+            return "¥—" if record.price is None else f"¥{record.price:g}"
+        return None
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self._records.clear()
+        self._rows_by_key.clear()
+        self.endResetModel()
+
+    def upsert(self, records: list[ProductRecord]) -> int:
+        for source in records:
+            record = ProductRecord.from_dict(source.to_dict())
+            row = self._rows_by_key.get(record.key)
+            if row is None:
+                row = len(self._records)
+                self.beginInsertRows(QModelIndex(), row, row)
+                self._records.append(record)
+                self._rows_by_key[record.key] = row
+                self.endInsertRows()
+            else:
+                self._records[row] = record
+                self.dataChanged.emit(self.index(row, 0), self.index(row, len(self._headers) - 1))
+        return len(self._records)
 
 
 class MainWindow(QMainWindow):
@@ -414,6 +483,40 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.stop_button)
         action_layout.addWidget(self.open_button)
         sidebar_layout.addWidget(action_panel)
+
+        self.result_panel = QFrame()
+        self.result_panel.setObjectName("resultPanel")
+        self.result_panel.setFixedHeight(190)
+        result_layout = QVBoxLayout(self.result_panel)
+        result_layout.setContentsMargins(14, 12, 14, 14)
+        result_layout.setSpacing(8)
+        result_header = QHBoxLayout()
+        self.result_count_label = QLabel("采集结果（0）")
+        self.result_count_label.setObjectName("sectionTitle")
+        result_header.addWidget(self.result_count_label)
+        result_header.addStretch(1)
+        result_layout.addLayout(result_header)
+        self.result_model = CrawlResultsModel(self)
+        self.result_view = QTableView()
+        self.result_view.setObjectName("resultTable")
+        self.result_view.setModel(self.result_model)
+        self.result_view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.result_view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.result_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.result_view.setAlternatingRowColors(True)
+        self.result_view.setWordWrap(True)
+        self.result_view.setTextElideMode(Qt.ElideRight)
+        self.result_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.result_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.result_view.verticalHeader().hide()
+        self.result_view.verticalHeader().setDefaultSectionSize(44)
+        result_header_view = self.result_view.horizontalHeader()
+        result_header_view.setSectionResizeMode(0, QHeaderView.Stretch)
+        result_header_view.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.result_view.doubleClicked.connect(self._open_result_item)
+        result_layout.addWidget(self.result_view)
+        sidebar_layout.addWidget(self.result_panel)
+        self.result_panel.hide()
         sidebar_layout.addStretch(1)
         workspace.addWidget(sidebar)
         root.addLayout(workspace)
@@ -450,7 +553,7 @@ class MainWindow(QMainWindow):
             }
             QMainWindow, QScrollArea#contentScroll, QScrollArea#contentScroll > QWidget,
             QWidget#appRoot { background: #f3f5f7; border: none; }
-            QFrame#surfacePanel, QFrame#statusPanel, QFrame#actionPanel,
+            QFrame#surfacePanel, QFrame#statusPanel, QFrame#actionPanel, QFrame#resultPanel,
             QFrame#logPanel, QFrame#loginPanel {
                 background: #ffffff; border: 1px solid #dbe1e8; border-radius: 12px;
             }
@@ -538,7 +641,7 @@ class MainWindow(QMainWindow):
             QTabBar::tab { min-width: 120px; min-height: 34px; padding: 4px 14px;
                 background: #e7ebef; color: #526174; font-weight: 700; }
             QTabBar::tab:selected { background: #ffd84d; color: #172033; }
-            QTableWidget { background: #ffffff; alternate-background-color: #f8fafb;
+            QTableWidget, QTableView#resultTable { background: #ffffff; alternate-background-color: #f8fafb;
                 border: 1px solid #dbe1e8; border-radius: 8px; gridline-color: #e8edf2; }
             QHeaderView::section { background: #eef2f5; color: #465468; border: none;
                 border-bottom: 1px solid #dbe1e8; padding: 8px; font-weight: 700; }
@@ -892,6 +995,25 @@ class MainWindow(QMainWindow):
         if selected:
             self.output_edit.setText(selected)
 
+    def _clear_result_records(self) -> None:
+        self.result_model.clear()
+        self.result_count_label.setText("采集结果（0）")
+        self.unique_value.setText("0")
+        self.result_panel.hide()
+
+    def _update_result_records(self, records: list[ProductRecord]) -> None:
+        if not records:
+            return
+        count = self.result_model.upsert(records)
+        self.result_count_label.setText(f"采集结果（{count:,}）")
+        self.unique_value.setText(f"{count:,}")
+        self.result_panel.show()
+
+    def _open_result_item(self, index: QModelIndex) -> None:
+        url = str(index.data(Qt.UserRole) or "")
+        if url.startswith("https://"):
+            QDesktopServices.openUrl(QUrl(url))
+
     def _append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.append(f"[{stamp}] {message}")
@@ -986,6 +1108,7 @@ class MainWindow(QMainWindow):
             )
             return
         self._last_output = None
+        self._clear_result_records()
         self.page_value.setText("0")
         self.raw_value.setText("0")
         self.unique_value.setText("0")
@@ -1006,6 +1129,7 @@ class MainWindow(QMainWindow):
         )
         self._crawl_worker.log.connect(self._append_log)
         self._crawl_worker.progress.connect(self._update_progress)
+        self._crawl_worker.page_records.connect(self._update_result_records)
         self._crawl_worker.verification.connect(self._verification_required)
         self._crawl_worker.succeeded.connect(self._crawl_succeeded)
         self._crawl_worker.failed.connect(self._crawl_failed)

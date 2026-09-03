@@ -41,6 +41,7 @@ class LoginWorker(QThread):
 
 class CrawlWorker(QThread):
     progress = Signal(object)
+    page_records = Signal(object)
     log = Signal(str)
     verification = Signal(str)
     succeeded = Signal(str, str, int)
@@ -67,6 +68,7 @@ class CrawlWorker(QThread):
                 checkpoint_store=store,
                 control=self.control,
                 on_progress=self._emit_progress,
+                on_page_records=self.page_records.emit,
                 on_log=self.log.emit,
                 on_verification=self.verification.emit,
             )

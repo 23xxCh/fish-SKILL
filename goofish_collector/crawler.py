@@ -85,6 +85,7 @@ class CrawlEngine:
         checkpoint_store: CheckpointStore,
         control: RunControl,
         on_progress: Callable[[CrawlProgress], None] | None = None,
+        on_page_records: Callable[[list[ProductRecord]], None] | None = None,
         on_log: Callable[[str], None] | None = None,
         on_verification: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -92,9 +93,14 @@ class CrawlEngine:
         self.checkpoint_store = checkpoint_store
         self.control = control
         self.on_progress = on_progress or (lambda _: None)
+        self.on_page_records = on_page_records or (lambda _: None)
         self.on_log = on_log or (lambda _: None)
         self.on_verification = on_verification or (lambda _: None)
         self.sleep = sleep
+
+    def _emit_page_records(self, records: list[ProductRecord]) -> None:
+        if records:
+            self.on_page_records([ProductRecord.from_dict(record.to_dict()) for record in records])
 
     def _call_with_retries(self, operation: Callable[[], T], label: str) -> T:
         failures = 0
@@ -169,6 +175,8 @@ class CrawlEngine:
             raise ValueError("检查点配置与当前任务不一致")
 
         collection = RecordCollection(resume.records if resume else ())
+        if resume is not None:
+            self._emit_page_records(collection.records)
         raw_records = resume.raw_records if resume else 0
         completed_pages = resume.current_page if resume else 0
         current_page = completed_pages + 1
@@ -215,6 +223,7 @@ class CrawlEngine:
                 raw_records += len(payloads)
                 captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 reached_item_limit = False
+                page_records: dict[str, ProductRecord] = {}
                 for payload in payloads:
                     record = parse_card(
                         payload,
@@ -225,12 +234,14 @@ class CrawlEngine:
                     if record is None:
                         continue
                     is_new = collection.add(record)
+                    page_records[record.key] = collection.get(record)
                     if is_new and config.max_items and len(collection) >= config.max_items:
                         reached_item_limit = True
                         break
 
                 completed_pages = current_page
                 self._save(config, completed_pages, raw_records, "running", collection)
+                self._emit_page_records(list(page_records.values()))
                 self.on_progress(
                     CrawlProgress(
                         current_page=current_page,

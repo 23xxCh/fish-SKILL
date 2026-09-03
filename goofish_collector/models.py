@@ -219,6 +219,9 @@ class RecordCollection:
     def __len__(self) -> int:
         return len(self._records)
 
+    def get(self, record: ProductRecord) -> ProductRecord:
+        return self._records[record.key]
+
     def add(self, record: ProductRecord) -> bool:
         existing = self._records.get(record.key)
         if existing is None:

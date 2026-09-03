@@ -75,6 +75,50 @@ def test_engine_collects_pages_and_merges_duplicates(tmp_path: Path) -> None:
     assert store.load().current_page == 2
 
 
+def test_engine_emits_each_page_delta_with_merged_duplicates(tmp_path: Path) -> None:
+    config = CrawlConfig("耳机", 50, 0, tmp_path)
+    engine, _ = make_engine(tmp_path, config)
+    received: list[list[ProductRecord]] = []
+
+    assert hasattr(engine, "on_page_records")
+    engine.on_page_records = received.append
+    result = engine.run(
+        config,
+        FakeSession([[card("1"), card("2")], [card("2", price=20), card("3")]]),
+    )
+
+    assert [[record.item_id for record in records] for records in received] == [
+        ["1", "2"],
+        ["2", "3"],
+    ]
+    assert received[1][0].appearances == 2
+    assert received[1][0].pages_seen == [1, 2]
+    assert received[1][0] is not result.records[1]
+
+
+def test_engine_emits_checkpoint_records_before_resuming(tmp_path: Path) -> None:
+    config = CrawlConfig("耳机", 50, 0, tmp_path)
+    engine, store = make_engine(tmp_path, config)
+    existing = ProductRecord(
+        keyword="耳机",
+        item_id="1",
+        title="旧商品",
+        url="https://www.goofish.com/item?id=1",
+        first_page=1,
+        pages_seen=[1],
+    )
+    resume = Checkpoint(config, current_page=1, raw_records=1, status="stopped", records=[existing])
+    store.save(resume)
+    received: list[list[ProductRecord]] = []
+
+    assert hasattr(engine, "on_page_records")
+    engine.on_page_records = received.append
+    engine.run(config, FakeSession([[card("1")], [card("2")]]), resume=resume)
+
+    assert [[record.item_id for record in records] for records in received] == [["1"], ["2"]]
+    assert received[0][0] is not existing
+
+
 def test_engine_stops_at_unique_item_limit(tmp_path: Path) -> None:
     config = CrawlConfig("耳机", 50, 2, tmp_path)
     engine, _ = make_engine(tmp_path, config)

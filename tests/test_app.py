@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from PySide6.QtGui import QPalette
@@ -6,6 +7,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from goofish_collector.app import MainWindow, light_palette
+from goofish_collector.models import ProductRecord
 
 
 @pytest.fixture(scope="module")
@@ -99,4 +101,91 @@ def test_price_inputs_accept_direct_number_typing(
     qt_app.processEvents()
 
     assert window.max_price_spin.value() == 800
+    window.close()
+
+
+def test_live_result_sidebar_upserts_current_task_records(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(default_output_dir=tmp_path)
+    window.show()
+    qt_app.processEvents()
+
+    assert hasattr(window, "result_model")
+    assert window.result_panel.isHidden()
+    first = ProductRecord(
+        keyword="耳机",
+        item_id="1",
+        title="全新耳机",
+        url="https://www.goofish.com/item?id=1",
+        price=10,
+        region="广东",
+        condition="全新",
+    )
+    window._update_result_records([first])
+    qt_app.processEvents()
+
+    assert window.result_panel.isVisible()
+    assert window.result_model.rowCount() == 1
+    assert window.result_count_label.text() == "采集结果（1）"
+    assert window.unique_value.text() == "1"
+
+    duplicate = ProductRecord(
+        keyword="耳机",
+        item_id="1",
+        title="全新耳机",
+        url="https://www.goofish.com/item?id=1",
+        price=20,
+        region="广东",
+        condition="全新",
+        appearances=2,
+        pages_seen=[1, 2],
+    )
+    window._update_result_records([duplicate])
+
+    assert window.result_model.rowCount() == 1
+    assert window.result_model.index(0, 1).data() == "¥20"
+
+    window._clear_result_records()
+    assert window.result_model.rowCount() == 0
+    assert window.result_panel.isHidden()
+    window.close()
+
+
+def test_live_result_sidebar_scrolls_all_rows_and_opens_only_https_items(
+    tmp_path: Path, qt_app: QApplication
+) -> None:
+    window = MainWindow(default_output_dir=tmp_path)
+    window.show()
+    records = [
+        ProductRecord(
+            keyword="耳机",
+            item_id=str(index),
+            title=f"耳机 {index}",
+            url=f"https://www.goofish.com/item?id={index}",
+            price=index,
+        )
+        for index in range(30)
+    ]
+    window._update_result_records(records)
+    qt_app.processEvents()
+
+    assert window.result_model.rowCount() == 30
+    assert window.result_view.verticalScrollBar().maximum() > 0
+    with patch("goofish_collector.app.QDesktopServices.openUrl") as open_url:
+        window._open_result_item(window.result_model.index(0, 0))
+        window._update_result_records(
+            [
+                ProductRecord(
+                    keyword="耳机",
+                    item_id="unsafe",
+                    title="不安全链接",
+                    url="file:///C:/not-an-item",
+                )
+            ]
+        )
+        window._open_result_item(window.result_model.index(30, 0))
+
+    assert open_url.call_count == 1
+    assert open_url.call_args.args[0].toString() == "https://www.goofish.com/item?id=0"
     window.close()
